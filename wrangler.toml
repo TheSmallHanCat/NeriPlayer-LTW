@@ -1,0 +1,11 @@
+name = "NeriPlayer-LTW"
+main = "src/worker.js"
+compatibility_date = "2026-03-19"
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "ListeningRoomDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ListeningRoomDO"]

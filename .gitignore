@@ -1,0 +1,9 @@
+.wrangler/
+.omc/
+node_modules/
+dist/
+.dev.vars
+.env
+.env.*
+!.dev.vars.example
+!.env.example
