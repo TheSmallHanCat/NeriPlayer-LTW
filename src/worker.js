@@ -28,7 +28,7 @@ const CONTROLLER_OFFLINE_GRACE_PERIOD_MS = 10 * 60 * 1000;
 const CONTROLLER_HEARTBEAT_TIMEOUT_MS = 35 * 1000;
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_PROCESSED_EVENT_IDS = 256;
-const MAX_QUEUE_SIZE = 500;
+const MAX_QUEUE_SIZE = 2000;
 const LINK_REQUEST_COOLDOWN_MS = 1500;
 const CONTROL_ARBITRATION_WINDOW_MS = 1500;
 const HEARTBEAT_SUPPRESSION_AFTER_MEMBER_CONTROL_MS = 4000;
@@ -971,7 +971,7 @@ export class ListeningRoomDO extends DurableObject {
       this.refreshControllerHeartbeat();
     }
     this.markProcessedEvent(eventId);
-    if (this.isTrackFinishBarrierReady()) {
+    if (isController || this.isTrackFinishBarrierReady()) {
       const applied = await this.completeTrackFinishBarrier({
         senderId,
         senderNickname,
