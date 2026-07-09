@@ -91,7 +91,7 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - `allowMemberControl`、`autoPauseOnMemberChange`、
   `shareAudioLinks` 三个房间设置都可通过事件更新
 - Token 有效期为 **24 小时**，由 `LISTEN_TOGETHER_TOKEN_SECRET` 参与 HMAC 签名
-- 队列上限为 **500** 首，避免房间状态无限膨胀
+- 队列上限为 **2000** 首，避免房间状态无限膨胀
 - 控制者心跳超时后房间会进入挂起状态，宽限期结束后自动关闭
 
 ## 安全与隐私边界
