@@ -50,6 +50,7 @@ const ALLOWED_EVENT_TYPES = new Set([
   'REQUEST_SEEK',
   'REQUEST_SET_TRACK',
   'HEARTBEAT',
+  'TRACK_FINISHED',
   'REQUEST_LINK',
   'LINK_READY',
   'UPDATE_SETTINGS',
@@ -392,6 +393,7 @@ export class ListeningRoomDO extends DurableObject {
       lastControlCommittedRole: null,
       lastControlCommittedType: null,
       lastMemberControlRequestSequence: 0,
+      trackFinishBarrier: null,
       updatedAt: nowMs(),
     };
   }
@@ -420,6 +422,7 @@ export class ListeningRoomDO extends DurableObject {
         lastControlCommittedRole: normalizeOptionalString(saved?.lastControlCommittedRole),
         lastControlCommittedType: normalizeOptionalString(saved?.lastControlCommittedType),
         lastMemberControlRequestSequence: Number(saved?.lastMemberControlRequestSequence) || 0,
+        trackFinishBarrier: this.normalizeTrackFinishBarrier(saved?.trackFinishBarrier),
       };
     }
   }
@@ -690,6 +693,54 @@ export class ListeningRoomDO extends DurableObject {
     return this.room.track || this.room.queue[this.room.currentIndex] || null;
   }
 
+  currentTrackStableKey() {
+    return this.currentTrack()?.stableKey || null;
+  }
+
+  normalizeTrackFinishBarrier(barrier) {
+    if (!isPlainObject(barrier)) return null;
+    const trackStableKey = normalizeOptionalString(barrier.trackStableKey);
+    if (!trackStableKey) return null;
+    const targetUserUuids = Array.isArray(barrier.targetUserUuids)
+      ? [...new Set(barrier.targetUserUuids.map(normalizeUserUuid).filter(Boolean))]
+      : [];
+    const finishedUserUuids = Array.isArray(barrier.finishedUserUuids)
+      ? [...new Set(barrier.finishedUserUuids.map(normalizeUserUuid).filter(Boolean))]
+      : [];
+    const proposal = isPlainObject(barrier.controllerProposal)
+      ? {
+          queue: sanitizeQueue(barrier.controllerProposal.queue),
+          currentIndex: Number.isInteger(barrier.controllerProposal.currentIndex)
+            ? barrier.controllerProposal.currentIndex
+            : 0,
+          track: sanitizeTrack(barrier.controllerProposal.track),
+          shouldAdvance: barrier.controllerProposal.shouldAdvance === true,
+        }
+      : null;
+    return {
+      trackStableKey,
+      targetUserUuids,
+      finishedUserUuids,
+      controllerProposal: proposal,
+      finishPositionMs: Math.max(0, Number(barrier.finishPositionMs ?? 0)),
+      createdAt: Number(barrier.createdAt) || nowMs(),
+    };
+  }
+
+  activeMemberUserUuids() {
+    const active = new Set();
+    for (const { auth } of this.sessions.values()) {
+      if (auth?.userUuid && this.room.members[auth.userUuid]) {
+        active.add(auth.userUuid);
+      }
+    }
+    return [...active];
+  }
+
+  clearTrackFinishBarrier() {
+    this.room.trackFinishBarrier = null;
+  }
+
   trackCommittedControl(type, senderId, role, committedAt = nowMs()) {
     this.room.lastControlCommittedAt = committedAt;
     this.room.lastControlCommittedBy = normalizeOptionalString(senderId);
@@ -775,8 +826,183 @@ export class ListeningRoomDO extends DurableObject {
     return true;
   }
 
+  shouldIgnoreHeartbeatForTrackFinishBarrier(event) {
+    const barrier = this.room.trackFinishBarrier;
+    if (!barrier?.trackStableKey) return false;
+    const eventTrack = sanitizeTrack(event.track);
+    const eventStableKey =
+      normalizeOptionalString(event.finishedTrackStableKey) ||
+      normalizeOptionalString(event.requestTrackStableKey) ||
+      eventTrack?.stableKey ||
+      this.currentTrackStableKey();
+    return eventStableKey === barrier.trackStableKey;
+  }
+
+  trackFinishTargets(senderId) {
+    const active = this.activeMemberUserUuids();
+    if (senderId && !active.includes(senderId) && this.room.members[senderId]) {
+      active.push(senderId);
+    }
+    return [...new Set(active)];
+  }
+
+  sanitizeTrackFinishProposal(event) {
+    const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
+    if (!nextQueue.length) {
+      return {
+        queue: [],
+        currentIndex: 0,
+        track: null,
+        shouldAdvance: false,
+      };
+    }
+    const rawNextIndex = Number.isInteger(event.nextIndex)
+      ? event.nextIndex
+      : event.currentIndex;
+    const nextIndex = normalizeIndex(rawNextIndex, nextQueue.length, this.room.currentIndex);
+    const nextTrack = sanitizeTrack(event.track) || nextQueue[nextIndex] || null;
+    return {
+      queue: nextQueue,
+      currentIndex: nextIndex,
+      track: nextTrack,
+      shouldAdvance: event.shouldPlay === true && Boolean(nextTrack),
+    };
+  }
+
+  pruneTrackFinishBarrierTargets() {
+    const barrier = this.room.trackFinishBarrier;
+    if (!barrier) return null;
+    const liveTargets = barrier.targetUserUuids.filter((userUuid) => this.room.members[userUuid]);
+    barrier.targetUserUuids = liveTargets;
+    barrier.finishedUserUuids = barrier.finishedUserUuids.filter((userUuid) => liveTargets.includes(userUuid));
+    return barrier;
+  }
+
+  isTrackFinishBarrierReady() {
+    const barrier = this.pruneTrackFinishBarrierTargets();
+    if (!barrier) return false;
+    if (!barrier.targetUserUuids.length) return true;
+    return barrier.targetUserUuids.every((userUuid) => barrier.finishedUserUuids.includes(userUuid));
+  }
+
+  async completeTrackFinishBarrier({ senderId, senderNickname, role, eventId, commitAt }) {
+    const barrier = this.room.trackFinishBarrier;
+    if (!barrier) return this.buildAppliedPayload('TRACK_FINISHED', senderId, eventId, senderNickname);
+    const proposal = barrier.controllerProposal;
+    this.clearTrackFinishBarrier();
+    if (proposal?.shouldAdvance && proposal.track) {
+      this.room.queue = proposal.queue;
+      this.room.currentIndex = normalizeIndex(proposal.currentIndex, proposal.queue.length, this.room.currentIndex);
+      this.room.track = proposal.track;
+      this.room.playback = {
+        ...this.room.playback,
+        state: 'playing',
+        basePositionMs: 0,
+        baseTimestampMs: commitAt,
+      };
+    } else {
+      this.room.playback = {
+        ...this.room.playback,
+        state: 'paused',
+        basePositionMs: Math.max(0, Number(barrier.finishPositionMs ?? this.expectedPosition(commitAt))),
+        baseTimestampMs: commitAt,
+      };
+    }
+    if (role === 'controller') {
+      this.refreshControllerHeartbeat();
+    }
+    this.trackCommittedControl('TRACK_FINISHED', senderId, role === 'controller' ? 'controller' : 'listener', commitAt);
+    this.room.roomStatus = 'active';
+    this.room.controllerOfflineSince = null;
+    this.room.closedReason = null;
+    this.room.version += 1;
+    await this.persist();
+    await this.scheduleLifecycleAlarm();
+    const payload = this.buildAppliedPayload('TRACK_FINISHED', senderId, eventId, senderNickname);
+    this.broadcast({
+      type: 'room_state_updated',
+      roomId: payload.roomId,
+      version: payload.version,
+      state: payload.state,
+      expectedPositionMs: payload.expectedPositionMs,
+      causedBy: payload.causedBy,
+    });
+    return payload;
+  }
+
+  async handleTrackFinishedEvent({ event, senderId, senderNickname, role, eventId, isController, commitAt }) {
+    const currentStableKey = this.currentTrackStableKey();
+    const finishedStableKey =
+      normalizeOptionalString(event.finishedTrackStableKey) ||
+      normalizeOptionalString(event.requestTrackStableKey) ||
+      currentStableKey;
+    if (!finishedStableKey || finishedStableKey !== currentStableKey) {
+      this.markProcessedEvent(eventId);
+      await this.persist();
+      return {
+        ok: true,
+        applied: this.buildAppliedPayload('TRACK_FINISHED', senderId, eventId, senderNickname),
+      };
+    }
+    let barrier = this.room.trackFinishBarrier;
+    if (!barrier || barrier.trackStableKey !== finishedStableKey) {
+      barrier = {
+        trackStableKey: finishedStableKey,
+        targetUserUuids: this.trackFinishTargets(senderId),
+        finishedUserUuids: [],
+        controllerProposal: null,
+        finishPositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition(commitAt))),
+        createdAt: commitAt,
+      };
+      this.room.trackFinishBarrier = barrier;
+    }
+    if (!barrier.targetUserUuids.includes(senderId) && this.room.members[senderId]) {
+      barrier.targetUserUuids.push(senderId);
+    }
+    if (!barrier.finishedUserUuids.includes(senderId)) {
+      barrier.finishedUserUuids.push(senderId);
+    }
+    barrier.finishPositionMs = Math.max(
+      barrier.finishPositionMs || 0,
+      Number(event.positionMs ?? this.expectedPosition(commitAt)) || 0
+    );
+    if (isController) {
+      barrier.controllerProposal = this.sanitizeTrackFinishProposal(event);
+      this.refreshControllerHeartbeat();
+    }
+    this.markProcessedEvent(eventId);
+    if (this.isTrackFinishBarrierReady()) {
+      const applied = await this.completeTrackFinishBarrier({
+        senderId,
+        senderNickname,
+        role,
+        eventId,
+        commitAt,
+      });
+      return { ok: true, applied };
+    }
+    await this.persist();
+    return {
+      ok: true,
+      applied: {
+        type: 'TRACK_FINISHED',
+        roomId: this.room.roomId,
+        causedBy: {
+          userUuid: senderId,
+          userId: senderId,
+          nickname: senderNickname,
+          eventId,
+          type: 'TRACK_FINISHED',
+        },
+      },
+    };
+  }
+
   async commitControlEvent({ event, type, effectiveType, senderId, senderNickname, role, eventId, isController, commitAt }) {
     const committedAt = commitAt || nowMs();
+    if (effectiveType !== 'HEARTBEAT' && effectiveType !== 'LINK_READY' && effectiveType !== 'UPDATE_SETTINGS') {
+      this.clearTrackFinishBarrier();
+    }
     if (effectiveType === 'PLAY') {
       const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
       const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
@@ -1093,6 +1319,7 @@ export class ListeningRoomDO extends DurableObject {
       if (!this.room.roomId) return json({ ok: false, error: 'room not initialized' }, 404);
       if (this.room.roomStatus === 'closed') return json({ ok: false, error: 'room closed' }, 410);
       const role = identity.userUuid === this.room.controllerUserUuid ? 'controller' : 'listener';
+      const hadTrackFinishBarrier = Boolean(this.room.trackFinishBarrier);
       this.room.members[identity.userUuid] = buildMember({ userUuid: identity.userUuid, nickname: identity.nickname, role, joinedAt: nowMs() });
       this.room.version += 1;
       await this.persist();
@@ -1107,7 +1334,9 @@ export class ListeningRoomDO extends DurableObject {
         },
         `member_joined:${identity.nickname}`
       );
-      await this.pauseForMemberChange(`member_joined:${identity.nickname}`, identity.userUuid, identity.nickname, 'MEMBER_JOINED');
+      if (!hadTrackFinishBarrier) {
+        await this.pauseForMemberChange(`member_joined:${identity.nickname}`, identity.userUuid, identity.nickname, 'MEMBER_JOINED');
+      }
       const token = await this.makeToken({ roomId: this.room.roomId, userUuid: identity.userUuid, nickname: identity.nickname, role });
       return json({
         ok: true,
@@ -1190,8 +1419,19 @@ export class ListeningRoomDO extends DurableObject {
     }
     if (this.room.members[auth.userUuid] && !this.hasActiveUserSession(auth.userUuid, session.sessionId)) {
       const nickname = this.room.members[auth.userUuid]?.nickname || auth.nickname || auth.userUuid;
+      const hadTrackFinishBarrier = Boolean(this.room.trackFinishBarrier);
       delete this.room.members[auth.userUuid];
       this.room.version += 1;
+      if (hadTrackFinishBarrier && this.isTrackFinishBarrierReady()) {
+        await this.completeTrackFinishBarrier({
+          senderId: auth.userUuid,
+          senderNickname: nickname,
+          role: auth.role,
+          eventId: null,
+          commitAt: nowMs(),
+        });
+        return;
+      }
       await this.persist();
       await this.broadcastRoomState(
         'room_state_updated',
@@ -1204,7 +1444,9 @@ export class ListeningRoomDO extends DurableObject {
         },
         `member_left:${nickname}`
       );
-      await this.pauseForMemberChange(`member_left:${nickname}`, auth.userUuid, nickname, 'MEMBER_LEFT');
+      if (!hadTrackFinishBarrier) {
+        await this.pauseForMemberChange(`member_left:${nickname}`, auth.userUuid, nickname, 'MEMBER_LEFT');
+      }
     }
   }
 
@@ -1296,6 +1538,18 @@ export class ListeningRoomDO extends DurableObject {
           },
         },
       };
+    }
+
+    if (type === 'TRACK_FINISHED') {
+      return this.handleTrackFinishedEvent({
+        event,
+        senderId,
+        senderNickname,
+        role,
+        eventId,
+        isController,
+        commitAt: committedAt,
+      });
     }
 
     if (type === 'REQUEST_LINK') {
@@ -1400,6 +1654,18 @@ export class ListeningRoomDO extends DurableObject {
             type,
           },
         },
+      };
+    }
+    if (effectiveType === 'HEARTBEAT' && this.shouldIgnoreHeartbeatForTrackFinishBarrier(event)) {
+      if (isController) {
+        this.refreshControllerHeartbeat();
+      }
+      this.markProcessedEvent(eventId);
+      await this.persist();
+      await this.scheduleLifecycleAlarm();
+      return {
+        ok: true,
+        applied: this.buildAppliedPayload(type, senderId, eventId, senderNickname),
       };
     }
     if (effectiveType === 'HEARTBEAT' && !this.shouldApplyControllerHeartbeat(committedAt)) {
