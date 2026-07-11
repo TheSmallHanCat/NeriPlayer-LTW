@@ -249,6 +249,19 @@ function sanitizeQueue(queue) {
   return next;
 }
 
+function stripTrackAudioLink(track) {
+  return track ? { ...track, streamUrl: null } : track;
+}
+
+function stripSharedAudioLinksFromState(state) {
+  if (!state?.settings || state.settings.shareAudioLinks !== false) return state;
+  return {
+    ...state,
+    queue: Array.isArray(state.queue) ? state.queue.map(stripTrackAudioLink) : [],
+    track: stripTrackAudioLink(state.track),
+  };
+}
+
 function sanitizeRoomSettings(settings) {
   return {
     allowMemberControl: settings?.allowMemberControl !== false,
@@ -493,7 +506,7 @@ export class ListeningRoomDO extends DurableObject {
   }
 
   sanitizeRoomState() {
-    return {
+    return stripSharedAudioLinksFromState({
       roomId: this.room.roomId,
       version: this.room.version,
       schemaVersion: this.room.schemaVersion,
@@ -514,7 +527,7 @@ export class ListeningRoomDO extends DurableObject {
       roomStatus: this.room.roomStatus || 'active',
       closedReason: this.room.closedReason ?? null,
       updatedAt: this.room.updatedAt,
-    };
+    });
   }
 
   expectedPosition(atMs = nowMs()) {
@@ -1103,6 +1116,10 @@ export class ListeningRoomDO extends DurableObject {
       this.room.track = this.room.queue[this.room.currentIndex] || this.room.track;
     } else if (effectiveType === 'UPDATE_SETTINGS') {
       this.room.settings = this.normalizeSettings(event.roomSettings);
+      if (this.room.settings.shareAudioLinks === false) {
+        this.room.queue = this.room.queue.map(stripTrackAudioLink);
+        this.room.track = stripTrackAudioLink(this.room.track);
+      }
     }
 
     if (isController) {
