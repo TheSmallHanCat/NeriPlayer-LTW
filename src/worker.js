@@ -43,6 +43,7 @@ const ALLOWED_EVENT_TYPES = new Set([
   'PLAY',
   'PAUSE',
   'SEEK',
+  'PLAYBACK_MODE',
   'SET_TRACK',
   'SET_QUEUE',
   'REQUEST_PLAY',

@@ -65,6 +65,7 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - `PLAY`
 - `PAUSE`
 - `SEEK`
+- `PLAYBACK_MODE`
 - `SET_TRACK`
 - `SET_QUEUE`
 - `HEARTBEAT`
@@ -75,6 +76,7 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - `REQUEST_PLAY`
 - `REQUEST_PAUSE`
 - `REQUEST_SEEK`
+- `REQUEST_PLAYBACK_MODE`
 - `REQUEST_SET_TRACK`
 
 ### 其他事件

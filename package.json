@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "node --check src/worker.js"
+    "check": "node --check src/worker.js && node test/protocol-contract.test.mjs"
   },
   "engines": {
     "node": ">=20"
