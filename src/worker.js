@@ -275,6 +275,15 @@ function requestedStableKeyForEvent(event, queue, currentIndex, track) {
     null;
 }
 
+function requestedStableKeyFromRequesterEvent(event) {
+  const requesterQueue = Array.isArray(event?.queue) ? sanitizeQueue(event.queue) : [];
+  const requesterIndex = normalizeIndex(event?.currentIndex, requesterQueue.length, 0);
+  return normalizeOptionalString(event?.requestTrackStableKey) ||
+    sanitizeTrack(event?.track)?.stableKey ||
+    requesterQueue[requesterIndex]?.stableKey ||
+    null;
+}
+
 function sanitizeRoomSettings(settings) {
   return {
     allowMemberControl: settings?.allowMemberControl !== false,
@@ -801,6 +810,7 @@ export class ListeningRoomDO extends DurableObject {
     const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
     const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
     const shouldUseRequesterQueue = effectiveType === 'SET_TRACK';
+    const requestedStableKey = requestedStableKeyFromRequesterEvent(event);
     const nextQueue = shouldUseRequesterQueue && Array.isArray(event.queue)
       ? sanitizeQueue(event.queue)
       : fallbackQueue;
@@ -833,7 +843,7 @@ export class ListeningRoomDO extends DurableObject {
       shouldPlay,
       stateName: nextState,
       clientTimeMs: Number(event.clientTimeMs) || nowMs(),
-      requestTrackStableKey: requestedStableKeyForEvent(event, nextQueue, nextIndex, nextTrack),
+      requestTrackStableKey: requestedStableKey || nextTrack?.stableKey || null,
     };
   }
 
@@ -841,15 +851,8 @@ export class ListeningRoomDO extends DurableObject {
     if (!TRACK_BOUND_REQUEST_TYPES.has(type)) {
       return { ok: true };
     }
-    const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
-    const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
     const currentStableKey = this.currentTrackStableKey();
-    const requestedStableKey = requestedStableKeyForEvent(
-      event,
-      fallbackQueue,
-      fallbackIndex,
-      this.currentTrack()
-    );
+    const requestedStableKey = requestedStableKeyFromRequesterEvent(event);
     if (requestedStableKey && currentStableKey && requestedStableKey === currentStableKey) {
       return { ok: true };
     }
