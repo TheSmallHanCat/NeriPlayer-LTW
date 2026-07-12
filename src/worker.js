@@ -78,6 +78,11 @@ const ARBITRATED_CONTROL_TYPES = new Set([
   'SET_QUEUE',
   'HEARTBEAT',
 ]);
+const TRACK_BOUND_REQUEST_TYPES = new Set([
+  'REQUEST_PLAY',
+  'REQUEST_PAUSE',
+  'REQUEST_SEEK',
+]);
 
 function toBase64Url(bytes) {
   const binary = String.fromCharCode(...bytes);
@@ -260,6 +265,14 @@ function stripSharedAudioLinksFromState(state) {
     queue: Array.isArray(state.queue) ? state.queue.map(stripTrackAudioLink) : [],
     track: stripTrackAudioLink(state.track),
   };
+}
+
+function requestedStableKeyForEvent(event, queue, currentIndex, track) {
+  return normalizeOptionalString(event?.requestTrackStableKey) ||
+    sanitizeTrack(event?.track)?.stableKey ||
+    queue?.[currentIndex]?.stableKey ||
+    track?.stableKey ||
+    null;
 }
 
 function sanitizeRoomSettings(settings) {
@@ -787,13 +800,20 @@ export class ListeningRoomDO extends DurableObject {
   sanitizeForwardedControlPayload(event, effectiveType) {
     const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
     const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
-    const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : fallbackQueue;
-    const nextIndex = normalizeIndex(
-      event.currentIndex,
-      nextQueue.length,
-      normalizeIndex(event.currentIndex, fallbackQueue.length, fallbackIndex)
-    );
-    const nextTrack = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.currentTrack();
+    const shouldUseRequesterQueue = effectiveType === 'SET_TRACK';
+    const nextQueue = shouldUseRequesterQueue && Array.isArray(event.queue)
+      ? sanitizeQueue(event.queue)
+      : fallbackQueue;
+    const nextIndex = shouldUseRequesterQueue
+      ? normalizeIndex(
+          event.currentIndex,
+          nextQueue.length,
+          normalizeIndex(event.currentIndex, fallbackQueue.length, fallbackIndex)
+        )
+      : fallbackIndex;
+    const nextTrack = shouldUseRequesterQueue
+      ? sanitizeTrack(event.track) || nextQueue[nextIndex] || this.currentTrack()
+      : this.currentTrack() || nextQueue[nextIndex] || null;
     const nextPositionMs = Math.max(0, Number(event.positionMs ?? this.expectedPosition()));
     const nextState =
       effectiveType === 'PLAY'
@@ -813,7 +833,29 @@ export class ListeningRoomDO extends DurableObject {
       shouldPlay,
       stateName: nextState,
       clientTimeMs: Number(event.clientTimeMs) || nowMs(),
-      requestTrackStableKey: normalizeOptionalString(event.requestTrackStableKey) || nextTrack?.stableKey || null,
+      requestTrackStableKey: requestedStableKeyForEvent(event, nextQueue, nextIndex, nextTrack),
+    };
+  }
+
+  shouldAcceptTrackBoundRequest(event, type) {
+    if (!TRACK_BOUND_REQUEST_TYPES.has(type)) {
+      return { ok: true };
+    }
+    const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
+    const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
+    const currentStableKey = this.currentTrackStableKey();
+    const requestedStableKey = requestedStableKeyForEvent(
+      event,
+      fallbackQueue,
+      fallbackIndex,
+      this.currentTrack()
+    );
+    if (requestedStableKey && currentStableKey && requestedStableKey === currentStableKey) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      error: 'member control target mismatch',
     };
   }
 
@@ -1633,6 +1675,10 @@ export class ListeningRoomDO extends DurableObject {
       const arbitration = this.shouldAcceptRequestedControl();
       if (!arbitration.ok) {
         return { ok: false, error: arbitration.error };
+      }
+      const trackBoundCheck = this.shouldAcceptTrackBoundRequest(event, type);
+      if (!trackBoundCheck.ok) {
+        return { ok: false, error: trackBoundCheck.error };
       }
       const forwardedPayload = this.sanitizeForwardedControlPayload(event, effectiveType);
       const requestSequence = this.nextMemberControlRequestSequence();
