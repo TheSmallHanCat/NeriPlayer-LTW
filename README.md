@@ -12,7 +12,8 @@
 - 控制者 / 听众双角色与 HMAC Token 鉴权
 - WebSocket 实时同步播放状态、队列、切歌和房间设置
 - 听众可发起控制请求，由控制者确认并广播最终状态
-- 可选共享房主解析出的播放直链，减少听众端重复取流压力
+- 可选共享房主解析出的播放直链，减少听众端重复取流压力；
+  关闭 `shareAudioLinks` 后会立刻清空房间里已缓存的直链
 - 房间状态持久化、控制者离线检测与自动关房
 - 成员进出房间时可自动暂停，避免多人状态失步
 - 支持 `Deploy to Cloudflare` 一键部署或本地源码手动部署
@@ -90,6 +91,11 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - Durable Object storage 持久化房间快照与成员状态
 - `allowMemberControl`、`autoPauseOnMemberChange`、
   `shareAudioLinks` 三个房间设置都可通过事件更新
+- 当 `shareAudioLinks=false` 时，HTTP `state` 快照和 WebSocket `room_state`
+  都不会返回 `track.streamUrl` 与 `queue[*].streamUrl`
+- `UPDATE_SETTINGS` 关闭 `shareAudioLinks` 后，会立即清空房间里已缓存的直链
+- `REQUEST_LINK` 在 `shareAudioLinks=false` 时会直接失败，返回
+  `audio link sharing disabled`
 - Token 有效期为 **24 小时**，由 `LISTEN_TOGETHER_TOKEN_SECRET` 参与 HMAC 签名
 - 队列上限为 **2000** 首，避免房间状态无限膨胀
 - 控制者心跳超时后房间会进入挂起状态，宽限期结束后自动关闭
