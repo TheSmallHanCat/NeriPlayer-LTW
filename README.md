@@ -55,9 +55,9 @@ Worker 只负责房间状态、权限、队列和同步事件。
 ```text
 [创建/加入房间] → [HTTP 返回 wsUrl + token]
         ↓
-[WebSocket 连接] → [room_state 快照]
+[WebSocket 连接] → [welcome 消息携带 state 快照]
         ↓
-[控制事件/听众请求] → [Durable Object 校验与落盘] → [广播新状态]
+[控制事件/听众请求] → [Durable Object 校验与落盘] → [广播 room_state_updated]
 ```
 
 ### 控制类事件
@@ -91,8 +91,9 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - Durable Object storage 持久化房间快照与成员状态
 - `allowMemberControl`、`autoPauseOnMemberChange`、
   `shareAudioLinks` 三个房间设置都可通过事件更新
-- 当 `shareAudioLinks=false` 时，HTTP `state` 快照和 WebSocket `room_state`
-  都不会返回 `track.streamUrl` 与 `queue[*].streamUrl`
+- 当 `shareAudioLinks=false` 时，HTTP `state` 快照，以及 WebSocket
+  `welcome` / `room_state_updated` 消息里的 `state`，都会把
+  `track.streamUrl` 与 `queue[*].streamUrl` 清空为 `null`
 - `UPDATE_SETTINGS` 关闭 `shareAudioLinks` 后，会立即清空房间里已缓存的直链
 - `REQUEST_LINK` 在 `shareAudioLinks=false` 时会直接失败，返回
   `audio link sharing disabled`
