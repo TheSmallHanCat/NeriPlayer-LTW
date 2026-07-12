@@ -48,6 +48,7 @@ const ALLOWED_EVENT_TYPES = new Set([
   'REQUEST_PLAY',
   'REQUEST_PAUSE',
   'REQUEST_SEEK',
+  'REQUEST_PLAYBACK_MODE',
   'REQUEST_SET_TRACK',
   'HEARTBEAT',
   'TRACK_FINISHED',
@@ -59,6 +60,7 @@ const CONTROLLABLE_EVENT_TYPES = new Set([
   'PLAY',
   'PAUSE',
   'SEEK',
+  'PLAYBACK_MODE',
   'SET_TRACK',
   'SET_QUEUE',
   'HEARTBEAT',
@@ -68,12 +70,14 @@ const REQUEST_CONTROL_EVENT_TYPES = new Set([
   'REQUEST_PLAY',
   'REQUEST_PAUSE',
   'REQUEST_SEEK',
+  'REQUEST_PLAYBACK_MODE',
   'REQUEST_SET_TRACK',
 ]);
 const ARBITRATED_CONTROL_TYPES = new Set([
   'PLAY',
   'PAUSE',
   'SEEK',
+  'PLAYBACK_MODE',
   'SET_TRACK',
   'SET_QUEUE',
   'HEARTBEAT',
@@ -193,6 +197,12 @@ function isPlainObject(value) {
 
 function normalizePlaybackState(value, fallback = 'paused') {
   if (value === 'playing' || value === 'paused') return value;
+  return fallback;
+}
+
+function normalizeRepeatMode(value, fallback = 0) {
+  const mode = Number(value);
+  if (mode === 0 || mode === 1 || mode === 2) return mode;
   return fallback;
 }
 
@@ -721,6 +731,8 @@ export class ListeningRoomDO extends DurableObject {
       track,
       isPlaying: snapshot?.isPlaying === true,
       positionMs: Number.isFinite(Number(snapshot?.positionMs)) ? Math.max(0, Math.floor(Number(snapshot.positionMs))) : 0,
+      repeatMode: normalizeRepeatMode(snapshot?.repeatMode, 0),
+      shuffleEnabled: snapshot?.shuffleEnabled === true,
     };
   }
 
@@ -844,6 +856,10 @@ export class ListeningRoomDO extends DurableObject {
       stateName: nextState,
       clientTimeMs: Number(event.clientTimeMs) || nowMs(),
       requestTrackStableKey: requestedStableKey || nextTrack?.stableKey || null,
+      repeatMode: normalizeRepeatMode(event.repeatMode, this.room.playback.repeatMode ?? 0),
+      shuffleEnabled: typeof event.shuffleEnabled === 'boolean'
+        ? event.shuffleEnabled
+        : this.room.playback.shuffleEnabled === true,
     };
   }
 
@@ -1061,6 +1077,10 @@ export class ListeningRoomDO extends DurableObject {
     if (effectiveType !== 'HEARTBEAT' && effectiveType !== 'LINK_READY' && effectiveType !== 'UPDATE_SETTINGS') {
       this.clearTrackFinishBarrier();
     }
+    const nextRepeatMode = normalizeRepeatMode(event.repeatMode, this.room.playback.repeatMode ?? 0);
+    const nextShuffleEnabled = typeof event.shuffleEnabled === 'boolean'
+      ? event.shuffleEnabled
+      : this.room.playback.shuffleEnabled === true;
     if (effectiveType === 'PLAY') {
       const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
       const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
@@ -1069,6 +1089,8 @@ export class ListeningRoomDO extends DurableObject {
         state: 'playing',
         basePositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition())),
         baseTimestampMs: committedAt,
+        repeatMode: nextRepeatMode,
+        shuffleEnabled: nextShuffleEnabled,
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
@@ -1081,6 +1103,8 @@ export class ListeningRoomDO extends DurableObject {
         state: 'paused',
         basePositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition())),
         baseTimestampMs: committedAt,
+        repeatMode: nextRepeatMode,
+        shuffleEnabled: nextShuffleEnabled,
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
@@ -1093,6 +1117,8 @@ export class ListeningRoomDO extends DurableObject {
         ...this.room.playback,
         basePositionMs: Math.max(0, Number(event.positionMs ?? 0)),
         baseTimestampMs: committedAt,
+        repeatMode: nextRepeatMode,
+        shuffleEnabled: nextShuffleEnabled,
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
@@ -1105,10 +1131,18 @@ export class ListeningRoomDO extends DurableObject {
         state: normalizePlaybackState(event.state, this.room.playback.state),
         basePositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition())),
         baseTimestampMs: committedAt,
+        repeatMode: nextRepeatMode,
+        shuffleEnabled: nextShuffleEnabled,
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
       this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
+    } else if (effectiveType === 'PLAYBACK_MODE') {
+      this.room.playback = {
+        ...this.room.playback,
+        repeatMode: nextRepeatMode,
+        shuffleEnabled: nextShuffleEnabled,
+      };
     } else if (effectiveType === 'LINK_READY') {
       if (!isController) {
         return { ok: false, error: 'only controller can publish link' };
@@ -1142,6 +1176,8 @@ export class ListeningRoomDO extends DurableObject {
         state: event.state === 'paused' ? 'paused' : this.room.playback.state,
         basePositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition())),
         baseTimestampMs: committedAt,
+        repeatMode: nextRepeatMode,
+        shuffleEnabled: nextShuffleEnabled,
       };
     } else if (effectiveType === 'SET_TRACK') {
       const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
@@ -1154,6 +1190,8 @@ export class ListeningRoomDO extends DurableObject {
         state: event.shouldPlay ? 'playing' : 'paused',
         basePositionMs: Math.max(0, Number(event.positionMs ?? 0)),
         baseTimestampMs: committedAt,
+        repeatMode: nextRepeatMode,
+        shuffleEnabled: nextShuffleEnabled,
       };
     } else if (effectiveType === 'SET_QUEUE') {
       this.room.queue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
@@ -1362,6 +1400,8 @@ export class ListeningRoomDO extends DurableObject {
           basePositionMs: snapshot.positionMs,
           baseTimestampMs: nowMs(),
           playbackRate: 1,
+          repeatMode: snapshot.repeatMode,
+          shuffleEnabled: snapshot.shuffleEnabled,
         };
         this.room.version = 1;
         await this.persist();
@@ -1684,43 +1724,30 @@ export class ListeningRoomDO extends DurableObject {
         return { ok: false, error: trackBoundCheck.error };
       }
       const forwardedPayload = this.sanitizeForwardedControlPayload(event, effectiveType);
-      const requestSequence = this.nextMemberControlRequestSequence();
-      this.markProcessedEvent(eventId);
-      await this.persist();
-      this.sendToController({
-        type: 'member_control_requested',
-        roomId: this.room.roomId,
-        requestSequence,
-        causedBy: {
-          userUuid: senderId,
-          userId: senderId,
-          nickname: senderNickname,
-          eventId,
-          type,
-        },
+      const committedEvent = {
+        ...event,
         queue: forwardedPayload.queue,
         currentIndex: forwardedPayload.currentIndex,
         track: forwardedPayload.track,
         positionMs: forwardedPayload.positionMs,
         shouldPlay: forwardedPayload.shouldPlay,
-        stateName: forwardedPayload.stateName,
+        state: forwardedPayload.stateName,
+        repeatMode: forwardedPayload.repeatMode,
+        shuffleEnabled: forwardedPayload.shuffleEnabled,
         clientTimeMs: forwardedPayload.clientTimeMs,
         requestTrackStableKey: forwardedPayload.requestTrackStableKey,
-      });
-      return {
-        ok: true,
-        applied: {
-          type,
-          roomId: this.room.roomId,
-          causedBy: {
-            userUuid: senderId,
-            userId: senderId,
-            nickname: senderNickname,
-            eventId,
-            type,
-          },
-        },
       };
+      return this.commitControlEvent({
+        event: committedEvent,
+        type,
+        effectiveType,
+        senderId,
+        senderNickname,
+        role,
+        eventId,
+        isController,
+        commitAt: committedAt,
+      });
     }
     if (effectiveType === 'HEARTBEAT' && this.shouldIgnoreHeartbeatForTrackFinishBarrier(event)) {
       if (isController) {
