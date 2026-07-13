@@ -303,6 +303,31 @@ function sanitizeRoomSettings(settings) {
   };
 }
 
+function normalizePositiveInteger(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return null;
+  return Math.floor(number);
+}
+
+function normalizeControlOrderKey(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized.length > 160) return null;
+  return /^[A-Za-z0-9:_-]+$/.test(normalized) ? normalized : null;
+}
+
+function normalizeControlOrderMap(value) {
+  if (!isPlainObject(value)) return {};
+  const next = {};
+  for (const [key, rawValue] of Object.entries(value)) {
+    const orderKey = normalizeControlOrderKey(key);
+    const number = normalizePositiveInteger(rawValue);
+    if (orderKey && number != null) {
+      next[orderKey] = number;
+    }
+  }
+  return next;
+}
+
 function buildWsUrl(requestUrl, roomId, token) {
   const url = new URL(requestUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -438,6 +463,8 @@ export class ListeningRoomDO extends DurableObject {
       lastControlCommittedBy: null,
       lastControlCommittedRole: null,
       lastControlCommittedType: null,
+      lastControlClientSequences: {},
+      lastControlClientTimes: {},
       lastMemberControlRequestSequence: 0,
       trackFinishBarrier: null,
       updatedAt: nowMs(),
@@ -467,6 +494,8 @@ export class ListeningRoomDO extends DurableObject {
         lastControlCommittedBy: normalizeOptionalString(saved?.lastControlCommittedBy),
         lastControlCommittedRole: normalizeOptionalString(saved?.lastControlCommittedRole),
         lastControlCommittedType: normalizeOptionalString(saved?.lastControlCommittedType),
+        lastControlClientSequences: normalizeControlOrderMap(saved?.lastControlClientSequences),
+        lastControlClientTimes: normalizeControlOrderMap(saved?.lastControlClientTimes),
         lastMemberControlRequestSequence: Number(saved?.lastMemberControlRequestSequence) || 0,
         trackFinishBarrier: this.normalizeTrackFinishBarrier(saved?.trackFinishBarrier),
       };
@@ -789,11 +818,77 @@ export class ListeningRoomDO extends DurableObject {
     this.room.trackFinishBarrier = null;
   }
 
-  trackCommittedControl(type, senderId, role, committedAt = nowMs()) {
+  eventClientSequence(event) {
+    return normalizePositiveInteger(event?.clientSequence);
+  }
+
+  eventClientInstanceId(event) {
+    const instanceId = normalizeOptionalString(event?.clientInstanceId);
+    if (!instanceId || instanceId.length > 80) return null;
+    return /^[A-Za-z0-9:_-]+$/.test(instanceId) ? instanceId : null;
+  }
+
+  eventClientTime(event) {
+    return normalizePositiveInteger(event?.clientTimeMs);
+  }
+
+  shouldOrderControlEvent(type, effectiveType) {
+    return CONTROLLABLE_EVENT_TYPES.has(effectiveType) ||
+      REQUEST_CONTROL_EVENT_TYPES.has(type);
+  }
+
+  controlSequenceOrderKey(event, senderId) {
+    const userUuid = normalizeUserUuid(senderId);
+    const instanceId = this.eventClientInstanceId(event);
+    if (!userUuid || !instanceId) return null;
+    return `${userUuid}:${instanceId}`;
+  }
+
+  controlTimeOrderKey(senderId) {
+    return normalizeUserUuid(senderId);
+  }
+
+  shouldDropOutdatedControlEvent(event, type, effectiveType, senderId) {
+    if (!this.shouldOrderControlEvent(type, effectiveType)) return false;
+
+    const clientSequence = this.eventClientSequence(event);
+    const sequenceKey = this.controlSequenceOrderKey(event, senderId);
+    const lastClientSequence = Number(this.room.lastControlClientSequences?.[sequenceKey]) || 0;
+    if (clientSequence != null && sequenceKey) {
+      return lastClientSequence > 0 && clientSequence <= lastClientSequence;
+    }
+
+    const clientTime = this.eventClientTime(event);
+    const timeKey = this.controlTimeOrderKey(senderId);
+    const lastClientTime = Number(this.room.lastControlClientTimes?.[timeKey]) || 0;
+    return clientTime != null && lastClientTime > 0 && clientTime < lastClientTime;
+  }
+
+  recordControlOrder(event, senderId) {
+    this.room.lastControlClientSequences = normalizeControlOrderMap(this.room.lastControlClientSequences);
+    this.room.lastControlClientTimes = normalizeControlOrderMap(this.room.lastControlClientTimes);
+
+    const clientSequence = this.eventClientSequence(event);
+    const sequenceKey = this.controlSequenceOrderKey(event, senderId);
+    if (clientSequence != null && sequenceKey) {
+      const previousSequence = Number(this.room.lastControlClientSequences[sequenceKey]) || 0;
+      this.room.lastControlClientSequences[sequenceKey] = Math.max(previousSequence, clientSequence);
+    }
+
+    const clientTime = this.eventClientTime(event);
+    const timeKey = this.controlTimeOrderKey(senderId);
+    if (clientTime != null && timeKey) {
+      const previousTime = Number(this.room.lastControlClientTimes[timeKey]) || 0;
+      this.room.lastControlClientTimes[timeKey] = Math.max(previousTime, clientTime);
+    }
+  }
+
+  trackCommittedControl(type, senderId, role, committedAt = nowMs(), event = null) {
     this.room.lastControlCommittedAt = committedAt;
     this.room.lastControlCommittedBy = normalizeOptionalString(senderId);
     this.room.lastControlCommittedRole = normalizeOptionalString(role);
     this.room.lastControlCommittedType = normalizeOptionalString(type);
+    this.recordControlOrder(event, senderId);
   }
 
   buildAppliedPayload(type, senderId, eventId, senderNickname = null) {
@@ -1210,7 +1305,7 @@ export class ListeningRoomDO extends DurableObject {
       this.refreshControllerHeartbeat();
     }
     if (ARBITRATED_CONTROL_TYPES.has(effectiveType) || REQUEST_CONTROL_EVENT_TYPES.has(type)) {
-      this.trackCommittedControl(effectiveType, senderId, isController ? 'controller' : 'listener', committedAt);
+      this.trackCommittedControl(effectiveType, senderId, isController ? 'controller' : 'listener', committedAt, event);
     }
     this.markProcessedEvent(eventId);
 
@@ -1254,8 +1349,17 @@ export class ListeningRoomDO extends DurableObject {
     return false;
   }
 
-  async pauseForMemberChange(message, userUuid, nickname, causedByType) {
-    if (this.room.settings?.autoPauseOnMemberChange !== true) return;
+  shouldSkipMemberChangeAutoPause(expectedVersion) {
+    if (this.room.settings?.autoPauseOnMemberChange !== true) return true;
+    if (expectedVersion != null && this.room.version !== expectedVersion) return true;
+    const lastAt = Number(this.room.lastControlCommittedAt) || 0;
+    return this.room.lastControlCommittedRole === 'controller' &&
+      this.room.lastControlCommittedType === 'PLAY' &&
+      nowMs() - lastAt < CONTROL_ARBITRATION_WINDOW_MS;
+  }
+
+  async pauseForMemberChange(message, userUuid, nickname, causedByType, expectedVersion = null) {
+    if (this.shouldSkipMemberChangeAutoPause(expectedVersion)) return;
     this.room.playback = {
       ...this.room.playback,
       state: 'paused',
@@ -1425,6 +1529,7 @@ export class ListeningRoomDO extends DurableObject {
       const hadTrackFinishBarrier = Boolean(this.room.trackFinishBarrier);
       this.room.members[identity.userUuid] = buildMember({ userUuid: identity.userUuid, nickname: identity.nickname, role, joinedAt: nowMs() });
       this.room.version += 1;
+      const memberChangeVersion = this.room.version;
       await this.persist();
       await this.broadcastRoomState(
         'room_state_updated',
@@ -1438,7 +1543,13 @@ export class ListeningRoomDO extends DurableObject {
         `member_joined:${identity.nickname}`
       );
       if (!hadTrackFinishBarrier) {
-        await this.pauseForMemberChange(`member_joined:${identity.nickname}`, identity.userUuid, identity.nickname, 'MEMBER_JOINED');
+        await this.pauseForMemberChange(
+          `member_joined:${identity.nickname}`,
+          identity.userUuid,
+          identity.nickname,
+          'MEMBER_JOINED',
+          memberChangeVersion
+        );
       }
       const token = await this.makeToken({ roomId: this.room.roomId, userUuid: identity.userUuid, nickname: identity.nickname, role });
       return json({
@@ -1525,6 +1636,7 @@ export class ListeningRoomDO extends DurableObject {
       const hadTrackFinishBarrier = Boolean(this.room.trackFinishBarrier);
       delete this.room.members[auth.userUuid];
       this.room.version += 1;
+      const memberChangeVersion = this.room.version;
       if (hadTrackFinishBarrier && this.isTrackFinishBarrierReady()) {
         await this.completeTrackFinishBarrier({
           senderId: auth.userUuid,
@@ -1548,7 +1660,13 @@ export class ListeningRoomDO extends DurableObject {
         `member_left:${nickname}`
       );
       if (!hadTrackFinishBarrier) {
-        await this.pauseForMemberChange(`member_left:${nickname}`, auth.userUuid, nickname, 'MEMBER_LEFT');
+        await this.pauseForMemberChange(
+          `member_left:${nickname}`,
+          auth.userUuid,
+          nickname,
+          'MEMBER_LEFT',
+          memberChangeVersion
+        );
       }
     }
   }
@@ -1640,6 +1758,15 @@ export class ListeningRoomDO extends DurableObject {
             type,
           },
         },
+      };
+    }
+
+    if (this.shouldDropOutdatedControlEvent(event, type, effectiveType, senderId)) {
+      this.markProcessedEvent(eventId);
+      await this.persist();
+      return {
+        ok: true,
+        applied: this.buildAppliedPayload(type, senderId, eventId, senderNickname),
       };
     }
 
