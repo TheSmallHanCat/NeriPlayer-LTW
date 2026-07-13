@@ -22,8 +22,20 @@ function expectSetContains(setName, eventType) {
   }
 }
 
+function expectSourceContains(pattern, description) {
+  if (!pattern.test(workerSource)) {
+    throw new Error(`worker must keep ${description}`);
+  }
+}
+
 expectSetContains('ALLOWED_EVENT_TYPES', 'PLAYBACK_MODE');
 expectSetContains('CONTROLLABLE_EVENT_TYPES', 'PLAYBACK_MODE');
 expectSetContains('ARBITRATED_CONTROL_TYPES', 'PLAYBACK_MODE');
 expectSetContains('ALLOWED_EVENT_TYPES', 'REQUEST_PLAYBACK_MODE');
 expectSetContains('REQUEST_CONTROL_EVENT_TYPES', 'REQUEST_PLAYBACK_MODE');
+expectSourceContains(/clientInstanceId/, 'client instance ordering scope');
+expectSourceContains(/clientSequence/, 'clientSequence ordering support');
+expectSourceContains(/lastControlClientSequences/, 'per-client sequence tracking');
+expectSourceContains(/shouldDropOutdatedControlEvent/, 'outdated control event gate');
+expectSourceContains(/shouldSkipMemberChangeAutoPause/, 'member-change auto-pause guard');
+expectSourceContains(/memberChangeVersion/, 'member-change version barrier');

@@ -10,8 +10,8 @@
 
 - 创建房间 / 加入房间，并直接返回可用的 `wsUrl`
 - 控制者 / 听众双角色与 HMAC Token 鉴权
-- WebSocket 实时同步播放状态、队列、切歌和房间设置
-- 听众可发起控制请求，由控制者确认并广播最终状态
+- WebSocket 实时同步播放状态、队列、切歌、循环模式、随机播放和房间设置
+- 听众可发起控制请求，由 Worker 校验房间策略、房主在线状态和目标歌曲后直接提交
 - 可选共享房主解析出的播放直链，减少听众端重复取流压力；
   关闭 `shareAudioLinks` 后会立刻清空房间里已缓存的直链
 - 房间状态持久化、控制者离线检测与自动关房
@@ -79,6 +79,11 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - `REQUEST_PLAYBACK_MODE`
 - `REQUEST_SET_TRACK`
 
+当 `allowMemberControl=true` 且控制者在线时，Worker 会直接仲裁并提交这些请求，
+不会再等待控制者客户端弹出确认。`REQUEST_PLAY`、`REQUEST_PAUSE` 和
+`REQUEST_SEEK` 必须携带能匹配当前歌曲的 `requestTrackStableKey`（也可从事件里的
+`track` 或 `queue[currentIndex]` 推导），避免延迟请求误操作已经切换的歌曲。
+
 ### 其他事件
 
 - `REQUEST_LINK`
@@ -92,7 +97,10 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - 每个房间对应一个 `ListeningRoomDO`
 - Durable Object storage 持久化房间快照与成员状态
 - `allowMemberControl`、`autoPauseOnMemberChange`、
-  `shareAudioLinks` 三个房间设置都可通过事件更新
+  `shareAudioLinks` 三个房间设置都可由控制者通过 `UPDATE_SETTINGS` 更新
+- `playback.repeatMode` 只接受 `0`（关闭）、`1`（单曲循环）、`2`（列表循环），
+  `playback.shuffleEnabled` 为布尔值；旧客户端缺少这些字段时，Android 客户端
+  仍按可选字段兼容
 - 当 `shareAudioLinks=false` 时，HTTP `state` 快照，以及 WebSocket
   `welcome` / `room_state_updated` 消息里的 `state`，都会把
   `track.streamUrl` 与 `queue[*].streamUrl` 清空为 `null`
@@ -101,12 +109,15 @@ Worker 只负责房间状态、权限、队列和同步事件。
   `audio link sharing disabled`
 - Token 有效期为 **24 小时**，由 `LISTEN_TOGETHER_TOKEN_SECRET` 参与 HMAC 签名
 - 队列上限为 **2000** 首，避免房间状态无限膨胀
-- 控制者心跳超时后房间会进入挂起状态，宽限期结束后自动关闭
+- 控制者心跳超过 **35 秒**未更新后房间会进入挂起状态；控制者在 **10 分钟**
+  宽限期内重连可恢复房间，超时后房间自动关闭并清理 Durable Object 存储
 
 ## 安全与隐私边界
 
 - Worker 不存储平台 Cookie、账号密码或 GitHub/WebDAV 凭据
 - WebSocket Token 只用于房间控制鉴权，不代表第三方音乐平台授权
+- `GET /api/rooms/:roomId/state` 当前是无需 Token 的只读快照接口；如需限制房间
+  状态可见性，请在自建实例前增加 Cloudflare Access 或等效访问控制
 - `shareAudioLinks` 开启时会同步房主解析出的播放直链，请只在可信房间使用
 - 自建实例的日志、访问控制和域名策略由部署者自己负责
 
