@@ -1,4 +1,4 @@
-name = "NeriPlayer-LTW"
+name = "neriplayer-ltw"
 main = "src/worker.js"
 compatibility_date = "2026-03-19"
 

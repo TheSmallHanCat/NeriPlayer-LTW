@@ -25,7 +25,7 @@ function nowMs() {
 }
 
 const CONTROLLER_OFFLINE_GRACE_PERIOD_MS = 10 * 60 * 1000;
-const CONTROLLER_HEARTBEAT_TIMEOUT_MS = 35 * 1000;
+const CONTROLLER_HEARTBEAT_TIMEOUT_MS = 45 * 1000;
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_PROCESSED_EVENT_IDS = 256;
 const MAX_QUEUE_SIZE = 2000;
@@ -465,6 +465,7 @@ export class ListeningRoomDO extends DurableObject {
       lastControlCommittedType: null,
       lastControlClientSequences: {},
       lastControlClientTimes: {},
+      // legacy relay sequence is kept so older persisted rooms hydrate without migration
       lastMemberControlRequestSequence: 0,
       trackFinishBarrier: null,
       updatedAt: nowMs(),
@@ -701,6 +702,7 @@ export class ListeningRoomDO extends DurableObject {
       version: this.room.version,
       state: this.sanitizeRoomState(),
       expectedPositionMs: this.expectedPosition(),
+      nowMs: nowMs(),
       message: 'controller_offline',
     });
   }
@@ -720,6 +722,7 @@ export class ListeningRoomDO extends DurableObject {
       version: this.room.version,
       state: this.sanitizeRoomState(),
       expectedPositionMs: this.expectedPosition(),
+      nowMs: nowMs(),
       message: 'controller_reconnected',
     });
   }
@@ -740,6 +743,7 @@ export class ListeningRoomDO extends DurableObject {
       version: this.room.version,
       state: this.sanitizeRoomState(),
       expectedPositionMs: this.expectedPosition(),
+      nowMs: nowMs(),
       causedBy,
       message,
     };
@@ -898,6 +902,7 @@ export class ListeningRoomDO extends DurableObject {
       version: this.room.version,
       state: this.sanitizeRoomState(),
       expectedPositionMs: this.expectedPosition(),
+      nowMs: nowMs(),
       causedBy: {
         userUuid: senderId,
         userId: senderId,
@@ -1095,6 +1100,7 @@ export class ListeningRoomDO extends DurableObject {
       version: payload.version,
       state: payload.state,
       expectedPositionMs: payload.expectedPositionMs,
+      nowMs: payload.nowMs,
       causedBy: payload.causedBy,
     });
     return payload;
@@ -1323,6 +1329,7 @@ export class ListeningRoomDO extends DurableObject {
       version: payload.version,
       state: payload.state,
       expectedPositionMs: payload.expectedPositionMs,
+      nowMs: payload.nowMs,
       causedBy: payload.causedBy,
     });
     return { ok: true, applied: payload };
@@ -1393,6 +1400,7 @@ export class ListeningRoomDO extends DurableObject {
       version: this.room.version,
       state: this.sanitizeRoomState(),
       expectedPositionMs: this.expectedPosition(),
+      nowMs: nowMs(),
       message: reason,
     };
     this.broadcast(payload);
@@ -1572,6 +1580,7 @@ export class ListeningRoomDO extends DurableObject {
         ok: true,
         state: this.sanitizeRoomState(),
         expectedPositionMs: this.expectedPosition(),
+        serverNowMs: nowMs(),
         autoPauseOnJoin: this.room.settings?.autoPauseOnMemberChange === true,
       });
     }
@@ -1619,6 +1628,7 @@ export class ListeningRoomDO extends DurableObject {
       autoPauseOnJoin: this.room.settings?.autoPauseOnMemberChange === true,
       state: this.sanitizeRoomState(),
       expectedPositionMs: this.expectedPosition(),
+      nowMs: nowMs(),
     }));
   }
 
@@ -1687,11 +1697,16 @@ export class ListeningRoomDO extends DurableObject {
         ws.send(JSON.stringify({ type: 'pong', nowMs: nowMs() }));
         return;
       }
+      if (msg.type === 'np_ping') {
+        ws.send(JSON.stringify({ type: 'np_pong', t: Number(msg.t) || null, nowMs: nowMs() }));
+        return;
+      }
       const result = await this.applyEvent({ ...msg, senderId: session.auth.userUuid, senderNickname: session.auth.nickname, role: session.auth.role });
       ws.send(JSON.stringify({
         type: 'control_result',
         ok: result.ok,
         result,
+        nowMs: nowMs(),
         message: result.error || null,
       }));
     } catch (err) {
