@@ -39,3 +39,8 @@ expectSourceContains(/lastControlClientSequences/, 'per-client sequence tracking
 expectSourceContains(/shouldDropOutdatedControlEvent/, 'outdated control event gate');
 expectSourceContains(/shouldSkipMemberChangeAutoPause/, 'member-change auto-pause guard');
 expectSourceContains(/memberChangeVersion/, 'member-change version barrier');
+expectSourceContains(/msg\.type === 'np_ping'/, 'custom clock-sync ping handling');
+expectSourceContains(/type: 'np_pong'/, 'custom clock-sync pong handling');
+expectSourceContains(/serverNowMs: nowMs\(\)/, 'HTTP state server clock timestamp');
+expectSourceContains(/nowMs: nowMs\(\)/, 'WebSocket server clock timestamp');
+expectSourceContains(/CONTROLLER_HEARTBEAT_TIMEOUT_MS = 45 \* 1000/, '45 second controller heartbeat timeout');
