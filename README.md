@@ -80,9 +80,11 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - `REQUEST_SET_TRACK`
 
 当 `allowMemberControl=true` 且控制者在线时，Worker 会直接仲裁并提交这些请求，
-不会再等待控制者客户端弹出确认。`REQUEST_PLAY`、`REQUEST_PAUSE` 和
-`REQUEST_SEEK` 必须携带能匹配当前歌曲的 `requestTrackStableKey`（也可从事件里的
-`track` 或 `queue[currentIndex]` 推导），避免延迟请求误操作已经切换的歌曲。
+不会再等待控制者客户端弹出确认。`REQUEST_PLAY`、`REQUEST_PAUSE`、
+`REQUEST_SEEK` 和 `REQUEST_PLAYBACK_MODE` 必须携带能匹配当前歌曲的
+`requestTrackStableKey`（也可从事件里的 `track` 或 `queue[currentIndex]` 推导），
+避免延迟请求误操作已经切换的歌曲。`REQUEST_SET_TRACK` 只能选择服务端当前队列
+中已有的曲目，成员携带的队列不会写入房态。
 
 ### 其他事件
 
