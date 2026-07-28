@@ -10,12 +10,14 @@
 
 - 创建房间 / 加入房间，并直接返回可用的 `wsUrl`
 - 控制者 / 听众双角色与 HMAC Token 鉴权
-- 邀请链接携带首次加入所需的 `joinSecret`；已有成员重连使用自己的
+- 邀请链接必须携带首次加入所需的 `joinSecret`；已有成员重连使用自己的
   `memberSecret`，这些密钥不会写入脱敏房间状态
 - WebSocket 实时同步播放状态、队列、切歌、循环模式、随机播放和房间设置
 - 听众可发起控制请求，由 Worker 校验房间策略、房主在线状态和目标歌曲后直接提交
-- 可选共享房主解析出的播放直链，减少听众端重复取流压力；
-  关闭 `shareAudioLinks` 后会立刻清空房间里已缓存的直链
+- 可选共享房主解析出的播放直链，减少听众端重复取流压力；Worker 会持久缓存
+  房主当前曲目的直链，缓存命中时听众无需等待房主在线，且只会公开当前曲目的链接
+- 本地歌曲不能创建房间或进入同步事件；关闭 `shareAudioLinks` 后会立刻清空
+  房间里已缓存的直链
 - 房间状态持久化、控制者离线检测与自动关房
 - 成员进出房间时可自动暂停，避免多人状态失步
 - 控制事件可携带 `clientInstanceId`、`clientSequence`、`clientTimeMs`，Worker 会
@@ -103,6 +105,9 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - `nickname` 长度为 **1-24**，当前允许中文、英文字母和数字
 - 每个房间对应一个 `ListeningRoomDO`
 - Durable Object storage 持久化房间快照与成员状态
+- 新成员必须提供正确的 `joinSecret` 才能加入；已有成员只能用自己的
+  `memberSecret` 或有效 Token 重连
+- 创建快照和后续控制事件均拒绝本地歌曲；旧房态中的本地歌曲会在加载时剔除
 - `allowMemberControl`、`autoPauseOnMemberChange`、
   `shareAudioLinks` 三个房间设置都可由控制者通过 `UPDATE_SETTINGS` 更新
 - `playback.repeatMode` 只接受 `0`（关闭）、`1`（单曲循环）、`2`（列表循环），
@@ -112,8 +117,12 @@ Worker 只负责房间状态、权限、队列和同步事件。
   `welcome` / `room_state_updated` 消息里的 `state`，都会把
   `track.streamUrl` 与 `queue[*].streamUrl` 清空为 `null`
 - `UPDATE_SETTINGS` 关闭 `shareAudioLinks` 后，会立即清空房间里已缓存的直链
+- 重新开启 `shareAudioLinks` 后，房主客户端会立即重新上传当前歌曲的直链；房态只会
+  公开当前曲目的缓存链接，历史缓存不会泄漏到队列中的其他歌曲
 - `REQUEST_LINK` 在 `shareAudioLinks=false` 时会直接失败，返回
   `audio link sharing disabled`
+- 命中当前曲目缓存的 `REQUEST_LINK` 会直接广播权威房态；`forceRefresh=true` 会绕过
+  缓存并向在线房主请求刷新，用于直链失效后的恢复
 - Token 有效期为 **24 小时**，由 `LISTEN_TOGETHER_TOKEN_SECRET` 参与 HMAC 签名
 - `/state` 与 `/control` 都需要有效的 `Authorization: Bearer <token>`；WebSocket
   连接使用返回的 `wsUrl` 中的 token
@@ -151,7 +160,7 @@ npm run check
 npx wrangler dev
 ```
 
-`npm run check` 会依次执行 `node --check src/worker.js`、协议契约测试和
+`npm run check` 会依次执行 `node --check src/worker.js`、缓存与协议测试和
 `wrangler deploy --dry-run`。它不替代真实 Cloudflare 环境中的 create/join/WebSocket
 流程验证。
 

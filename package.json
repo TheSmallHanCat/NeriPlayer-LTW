@@ -7,8 +7,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "lint": "node --check src/worker.js",
-    "test": "node test/protocol-contract.test.mjs",
+    "lint": "node --check src/worker.js && node --check src/stream-url-cache.js",
+    "test": "node --test test/*.test.mjs",
     "deploy:dry-run": "wrangler deploy --dry-run",
     "check": "npm run lint && npm test && npm run deploy:dry-run"
   },

@@ -64,3 +64,8 @@ expectSourceContains(/neriplayer-listen-together-worker/, 'public health endpoin
 expectSourceContains(/ROOM_JOIN_SECRET_BYTES = 32/, 'room invite secret entropy');
 expectSourceContains(/join_secret_required/, 'invite secret rejection');
 expectSourceContains(/crypto\.getRandomValues\(new Uint8Array\(len\)\)/, 'cryptographically random room identifiers');
+expectSourceContains(/streamUrlCache/, 'durable room stream URL cache');
+expectSourceContains(/requested link does not match current track/, 'stale link request rejection');
+expectSourceContains(/link target does not match current track/, 'stale link publication rejection');
+expectSourceContains(/event\.forceRefresh/, 'forced cache bypass for a stalled listener');
+expectSourceContains(/local tracks cannot be shared/, 'local track rejection');
