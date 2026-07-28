@@ -1,4 +1,10 @@
 import { DurableObject } from 'cloudflare:workers';
+import {
+  cacheStreamUrl,
+  cachedStreamUrlForTrack,
+  normalizeStreamUrlCache,
+  publicRoomStateWithCurrentStreamUrl,
+} from './stream-url-cache.js';
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -270,6 +276,7 @@ function sanitizeTrack(track) {
   const name = normalizeOptionalString(track.name);
   const artist = normalizeOptionalString(track.artist);
   if (!stableKey || !channelId || !audioId || !name || !artist) return null;
+  if (channelId.toLowerCase() === 'local') return null;
   const durationMs = Number.isFinite(Number(track.durationMs)) ? Math.max(0, Math.floor(Number(track.durationMs))) : 0;
   return {
     stableKey,
@@ -287,6 +294,15 @@ function sanitizeTrack(track) {
   };
 }
 
+function isLocalTrackInput(track) {
+  return isPlainObject(track) && normalizeOptionalString(track.channelId)?.toLowerCase() === 'local';
+}
+
+function eventContainsLocalTrack(event) {
+  if (isLocalTrackInput(event?.track)) return true;
+  return Array.isArray(event?.queue) && event.queue.some(isLocalTrackInput);
+}
+
 function sanitizeQueue(queue) {
   if (!Array.isArray(queue)) return [];
   const next = [];
@@ -300,15 +316,6 @@ function sanitizeQueue(queue) {
 
 function stripTrackAudioLink(track) {
   return track ? { ...track, streamUrl: null } : track;
-}
-
-function stripSharedAudioLinksFromState(state) {
-  if (!state?.settings || state.settings.shareAudioLinks !== false) return state;
-  return {
-    ...state,
-    queue: Array.isArray(state.queue) ? state.queue.map(stripTrackAudioLink) : [],
-    track: stripTrackAudioLink(state.track),
-  };
 }
 
 function requestedStableKeyForEvent(event, queue, currentIndex, track) {
@@ -483,6 +490,7 @@ export class ListeningRoomDO extends DurableObject {
       queue: [],
       currentIndex: 0,
       track: null,
+      streamUrlCache: {},
       playback: {
         state: 'paused',
         basePositionMs: 0,
@@ -510,6 +518,25 @@ export class ListeningRoomDO extends DurableObject {
     const saved = await this.state.storage.get('room');
     if (saved) {
       const joinSecret = normalizeOptionalString(saved?.joinSecret) || randomRoomJoinSecret();
+      const settings = this.normalizeSettings(saved?.settings);
+      const queue = sanitizeQueue(saved?.queue);
+      const currentIndex = normalizeIndex(saved?.currentIndex, queue.length, 0);
+      const selectedQueueTrack = queue[currentIndex] || null;
+      const savedTrack = sanitizeTrack(saved?.track);
+      const track = savedTrack?.stableKey === selectedQueueTrack?.stableKey
+        ? savedTrack
+        : selectedQueueTrack;
+      let streamUrlCache = normalizeStreamUrlCache(saved?.streamUrlCache);
+      if (settings.shareAudioLinks) {
+        streamUrlCache = cacheStreamUrl(
+          streamUrlCache,
+          track?.stableKey,
+          track?.streamUrl,
+          saved?.updatedAt
+        );
+      } else {
+        streamUrlCache = {};
+      }
       const rawMembers = saved?.members && typeof saved.members === 'object' ? saved.members : {};
       const members = {};
       for (const [memberKey, memberValue] of Object.entries(rawMembers)) {
@@ -523,9 +550,14 @@ export class ListeningRoomDO extends DurableObject {
         ...this.createEmptyRoom(),
         ...saved,
         joinSecret,
+        settings,
         controllerUserUuid,
         controllerUserId: controllerUserUuid,
         members,
+        queue: queue.map(stripTrackAudioLink),
+        currentIndex,
+        track: stripTrackAudioLink(track),
+        streamUrlCache,
         processedEventIds: Array.isArray(saved.processedEventIds) ? saved.processedEventIds : [],
         lastControlCommittedAt: Number(saved?.lastControlCommittedAt) || 0,
         lastControlCommittedBy: normalizeOptionalString(saved?.lastControlCommittedBy),
@@ -536,7 +568,10 @@ export class ListeningRoomDO extends DurableObject {
         lastMemberControlRequestSequence: Number(saved?.lastMemberControlRequestSequence) || 0,
         trackFinishBarrier: this.normalizeTrackFinishBarrier(saved?.trackFinishBarrier),
       };
-      if (!normalizeOptionalString(saved?.joinSecret)) {
+      const hadStoredAudioLink = queue.some((item) => item.streamUrl) || Boolean(savedTrack?.streamUrl);
+      const hadStoredLocalTrack = eventContainsLocalTrack(saved);
+      const cacheChanged = JSON.stringify(streamUrlCache) !== JSON.stringify(saved?.streamUrlCache || {});
+      if (!normalizeOptionalString(saved?.joinSecret) || hadStoredAudioLink || hadStoredLocalTrack || cacheChanged) {
         await this.persist();
       }
     }
@@ -608,7 +643,7 @@ export class ListeningRoomDO extends DurableObject {
   }
 
   sanitizeRoomState() {
-    return stripSharedAudioLinksFromState({
+    return publicRoomStateWithCurrentStreamUrl({
       roomId: this.room.roomId,
       version: this.room.version,
       schemaVersion: this.room.schemaVersion,
@@ -629,7 +664,27 @@ export class ListeningRoomDO extends DurableObject {
       roomStatus: this.room.roomStatus || 'active',
       closedReason: this.room.closedReason ?? null,
       updatedAt: this.room.updatedAt,
-    });
+    }, this.room.streamUrlCache);
+  }
+
+  refreshCurrentStreamUrlCache() {
+    if (this.room.settings?.shareAudioLinks !== false) {
+      const currentTrack = this.currentTrack();
+      const queueTrack = this.room.queue[this.room.currentIndex] || null;
+      const candidate = [this.room.track, queueTrack].find((track) =>
+        track?.stableKey === currentTrack?.stableKey && track.streamUrl
+      );
+      this.room.streamUrlCache = cacheStreamUrl(
+        this.room.streamUrlCache,
+        currentTrack?.stableKey,
+        candidate?.streamUrl
+      );
+    } else {
+      this.room.streamUrlCache = {};
+    }
+    this.normalizeCurrentTrack();
+    this.room.queue = this.room.queue.map(stripTrackAudioLink);
+    this.room.track = stripTrackAudioLink(this.room.track);
   }
 
   expectedPosition(atMs = nowMs()) {
@@ -796,7 +851,7 @@ export class ListeningRoomDO extends DurableObject {
   sanitizeInitialSnapshot(snapshot) {
     const queue = sanitizeQueue(snapshot?.queue);
     const currentIndex = normalizeIndex(snapshot?.currentIndex, queue.length, 0);
-    const track = sanitizeTrack(snapshot?.track) || queue[currentIndex] || null;
+    const track = queue[currentIndex] || null;
     return {
       settings: this.normalizeSettings(snapshot?.settings),
       queue,
@@ -809,8 +864,24 @@ export class ListeningRoomDO extends DurableObject {
     };
   }
 
+  eventQueueOrCurrent(eventQueue) {
+    if (!Array.isArray(eventQueue)) return this.room.queue;
+    const nextQueue = sanitizeQueue(eventQueue);
+    return nextQueue.length ? nextQueue : this.room.queue;
+  }
+
+  normalizeCurrentTrack() {
+    this.room.currentIndex = normalizeIndex(
+      this.room.currentIndex,
+      this.room.queue.length,
+      this.room.currentIndex
+    );
+    const queueTrack = this.room.queue[this.room.currentIndex] || null;
+    this.room.track = queueTrack || sanitizeTrack(this.room.track);
+  }
+
   currentTrack() {
-    return this.room.track || this.room.queue[this.room.currentIndex] || null;
+    return this.room.queue[this.room.currentIndex] || this.room.track || null;
   }
 
   currentTrackStableKey() {
@@ -1066,7 +1137,7 @@ export class ListeningRoomDO extends DurableObject {
   }
 
   sanitizeTrackFinishProposal(event) {
-    const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
+    const nextQueue = this.eventQueueOrCurrent(event.queue);
     if (!nextQueue.length) {
       return {
         queue: [],
@@ -1079,7 +1150,7 @@ export class ListeningRoomDO extends DurableObject {
       ? event.nextIndex
       : event.currentIndex;
     const nextIndex = normalizeIndex(rawNextIndex, nextQueue.length, this.room.currentIndex);
-    const nextTrack = sanitizeTrack(event.track) || nextQueue[nextIndex] || null;
+    const nextTrack = nextQueue[nextIndex] || null;
     return {
       queue: nextQueue,
       currentIndex: nextIndex,
@@ -1127,6 +1198,7 @@ export class ListeningRoomDO extends DurableObject {
         baseTimestampMs: commitAt,
       };
     }
+    this.refreshCurrentStreamUrlCache();
     if (role === 'controller') {
       this.refreshControllerHeartbeat();
     }
@@ -1228,7 +1300,7 @@ export class ListeningRoomDO extends DurableObject {
       ? event.shuffleEnabled
       : this.room.playback.shuffleEnabled === true;
     if (effectiveType === 'PLAY') {
-      const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
+      const nextQueue = this.eventQueueOrCurrent(event.queue);
       const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
       this.room.playback = {
         ...this.room.playback,
@@ -1242,7 +1314,7 @@ export class ListeningRoomDO extends DurableObject {
       this.room.currentIndex = nextIndex;
       this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
     } else if (effectiveType === 'PAUSE') {
-      const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
+      const nextQueue = this.eventQueueOrCurrent(event.queue);
       const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
       this.room.playback = {
         ...this.room.playback,
@@ -1256,7 +1328,7 @@ export class ListeningRoomDO extends DurableObject {
       this.room.currentIndex = nextIndex;
       this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
     } else if (effectiveType === 'SEEK') {
-      const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
+      const nextQueue = this.eventQueueOrCurrent(event.queue);
       const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
       const currentTrack = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.currentTrack();
       this.room.playback = {
@@ -1270,7 +1342,7 @@ export class ListeningRoomDO extends DurableObject {
       this.room.currentIndex = nextIndex;
       this.room.track = currentTrack;
     } else if (effectiveType === 'HEARTBEAT') {
-      const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
+      const nextQueue = this.eventQueueOrCurrent(event.queue);
       const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
       this.room.playback = {
         ...this.room.playback,
@@ -1305,28 +1377,22 @@ export class ListeningRoomDO extends DurableObject {
       if (!targetStableKey) {
         return { ok: false, error: 'missing requestTrackStableKey' };
       }
-      const mergeTrack = (track) => {
-        if (!track || track.stableKey !== targetStableKey) return track;
-        const nextUrl = sanitizedEventTrack?.streamUrl || track.streamUrl || null;
-        return nextUrl ? { ...track, streamUrl: nextUrl } : track;
-      };
-      if (Array.isArray(event.queue)) {
-        this.room.queue = sanitizeQueue(event.queue).map(mergeTrack);
-      } else {
-        this.room.queue = this.room.queue.map(mergeTrack);
+      const currentStableKey = this.currentTrackStableKey();
+      if (!currentStableKey || targetStableKey !== currentStableKey) {
+        return { ok: false, error: 'link target does not match current track' };
       }
-      this.room.currentIndex = normalizeIndex(event.currentIndex, this.room.queue.length, this.room.currentIndex);
-      this.room.track = mergeTrack(sanitizedEventTrack || this.currentTrack());
-      this.room.playback = {
-        ...this.room.playback,
-        state: event.state === 'paused' ? 'paused' : this.room.playback.state,
-        basePositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition())),
-        baseTimestampMs: committedAt,
-        repeatMode: nextRepeatMode,
-        shuffleEnabled: nextShuffleEnabled,
-      };
+      const streamUrl = sanitizedEventTrack?.streamUrl;
+      if (!streamUrl) {
+        return { ok: false, error: 'missing direct stream URL' };
+      }
+      this.room.streamUrlCache = cacheStreamUrl(
+        this.room.streamUrlCache,
+        targetStableKey,
+        streamUrl,
+        committedAt
+      );
     } else if (effectiveType === 'SET_TRACK') {
-      const nextQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
+      const nextQueue = this.eventQueueOrCurrent(event.queue);
       const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
@@ -1340,7 +1406,7 @@ export class ListeningRoomDO extends DurableObject {
         shuffleEnabled: nextShuffleEnabled,
       };
     } else if (effectiveType === 'SET_QUEUE') {
-      this.room.queue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : this.room.queue;
+      this.room.queue = this.eventQueueOrCurrent(event.queue);
       this.room.currentIndex = normalizeIndex(event.currentIndex, this.room.queue.length, this.room.currentIndex);
       this.room.track = this.room.queue[this.room.currentIndex] || this.room.track;
     } else if (effectiveType === 'UPDATE_SETTINGS') {
@@ -1350,6 +1416,8 @@ export class ListeningRoomDO extends DurableObject {
         this.room.track = stripTrackAudioLink(this.room.track);
       }
     }
+
+    this.refreshCurrentStreamUrlCache();
 
     if (isController) {
       this.refreshControllerHeartbeat();
@@ -1388,6 +1456,23 @@ export class ListeningRoomDO extends DurableObject {
     }
     this.linkRequestCooldowns.set(key, now);
     return true;
+  }
+
+  async publishCachedLinkState(senderId, senderNickname, eventId) {
+    this.markProcessedEvent(eventId);
+    this.room.version += 1;
+    await this.persist();
+    const payload = this.buildAppliedPayload('REQUEST_LINK', senderId, eventId, senderNickname);
+    this.broadcast({
+      type: 'room_state_updated',
+      roomId: payload.roomId,
+      version: payload.version,
+      state: payload.state,
+      expectedPositionMs: payload.expectedPositionMs,
+      nowMs: payload.nowMs,
+      causedBy: payload.causedBy,
+    });
+    return { ok: true, applied: payload };
   }
 
   hasActiveUserSession(userUuid, excludeSessionId = null) {
@@ -1550,11 +1635,17 @@ export class ListeningRoomDO extends DurableObject {
       if (userUuidError) return json({ ok: false, error: userUuidError }, 400);
       const nicknameError = validateNickname(normalizedNickname);
       if (nicknameError) return json({ ok: false, error: nicknameError }, 400);
+      if (eventContainsLocalTrack(initialSnapshot)) {
+        return json({ ok: false, error: 'local tracks cannot be shared' }, 400);
+      }
       if (this.room.roomId) {
         return json({ ok: false, error: 'room already initialized' }, 409);
       }
       if (!this.room.roomId) {
         const snapshot = this.sanitizeInitialSnapshot(initialSnapshot);
+        if (!snapshot.track || snapshot.queue.length === 0) {
+          return json({ ok: false, error: 'initial snapshot requires a shareable current track' }, 400);
+        }
         this.room.roomId = normalizedRoomId;
         this.room.joinSecret = randomRoomJoinSecret();
         this.room.controllerUserUuid = normalizedUserUuid;
@@ -1566,6 +1657,7 @@ export class ListeningRoomDO extends DurableObject {
         this.room.queue = snapshot.queue;
         this.room.currentIndex = snapshot.currentIndex;
         this.room.track = snapshot.track;
+        this.refreshCurrentStreamUrlCache();
         this.room.playback = {
           state: snapshot.isPlaying ? 'playing' : 'paused',
           basePositionMs: snapshot.positionMs,
@@ -1837,6 +1929,9 @@ export class ListeningRoomDO extends DurableObject {
     if (senderId && !this.room.members[senderId]) {
       return { ok: false, error: 'member not in room' };
     }
+    if (eventContainsLocalTrack(event)) {
+      return { ok: false, error: 'local tracks cannot be shared' };
+    }
     if ((CONTROLLABLE_EVENT_TYPES.has(type) || REQUEST_CONTROL_EVENT_TYPES.has(type)) && this.room.roomStatus === 'controller_offline' && !isController) {
       return { ok: false, error: 'controller offline' };
     }
@@ -1891,19 +1986,25 @@ export class ListeningRoomDO extends DurableObject {
       if (this.room.settings?.shareAudioLinks === false) {
         return { ok: false, error: 'audio link sharing disabled' };
       }
-      if (this.room.roomStatus === 'controller_offline' && !isController) {
-        return { ok: false, error: 'controller offline' };
-      }
-      const targetTrack = sanitizeTrack(event.track) || this.currentTrack();
-      const requestTrackStableKey = normalizeOptionalString(event.requestTrackStableKey) || targetTrack?.stableKey || null;
+      const targetTrack = this.currentTrack();
+      const requestTrackStableKey = normalizeOptionalString(event.requestTrackStableKey);
       if (!requestTrackStableKey) {
         return { ok: false, error: 'missing requestTrackStableKey' };
       }
-      if (!isController && !this.controllerSessions().length) {
-        return { ok: false, error: 'controller offline' };
+      if (!targetTrack || requestTrackStableKey !== targetTrack.stableKey) {
+        return { ok: false, error: 'requested link does not match current track' };
       }
       if (!isController && !this.consumeLinkRequestBudget(senderId, requestTrackStableKey)) {
         return { ok: false, error: 'link request throttled' };
+      }
+      if (!event.forceRefresh && cachedStreamUrlForTrack(this.room.streamUrlCache, requestTrackStableKey)) {
+        return this.publishCachedLinkState(senderId, senderNickname, eventId);
+      }
+      if (this.room.roomStatus === 'controller_offline' && !isController) {
+        return { ok: false, error: 'controller offline' };
+      }
+      if (!isController && !this.controllerSessions().length) {
+        return { ok: false, error: 'controller offline' };
       }
       this.sendToController({
         type: 'link_requested',
@@ -1916,7 +2017,7 @@ export class ListeningRoomDO extends DurableObject {
           type,
         },
         track: targetTrack,
-        currentIndex: normalizeIndex(event.currentIndex, this.room.queue.length, this.room.currentIndex),
+        currentIndex: this.room.currentIndex,
         requestTrackStableKey,
       });
       return {
