@@ -15,9 +15,16 @@ function json(data, status = 200, extraHeaders = {}) {
 
 function randomId(len = 6) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let out = '';
-  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
-  return out;
+  const randomBytes = crypto.getRandomValues(new Uint8Array(len));
+  return Array.from(randomBytes, (value) => chars[value & (chars.length - 1)]).join('');
+}
+
+function randomMemberSecret() {
+  return toBase64Url(crypto.getRandomValues(new Uint8Array(MEMBER_SECRET_BYTES)));
+}
+
+function randomRoomJoinSecret() {
+  return toBase64Url(crypto.getRandomValues(new Uint8Array(ROOM_JOIN_SECRET_BYTES)));
 }
 
 function nowMs() {
@@ -27,6 +34,8 @@ function nowMs() {
 const CONTROLLER_OFFLINE_GRACE_PERIOD_MS = 10 * 60 * 1000;
 const CONTROLLER_HEARTBEAT_TIMEOUT_MS = 45 * 1000;
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+const MEMBER_SECRET_BYTES = 32;
+const ROOM_JOIN_SECRET_BYTES = 32;
 const MAX_PROCESSED_EVENT_IDS = 256;
 const MAX_QUEUE_SIZE = 2000;
 const LINK_REQUEST_COOLDOWN_MS = 1500;
@@ -87,6 +96,10 @@ const TRACK_BOUND_REQUEST_TYPES = new Set([
   'REQUEST_PLAY',
   'REQUEST_PAUSE',
   'REQUEST_SEEK',
+  'REQUEST_PLAYBACK_MODE',
+]);
+const TRACK_QUEUE_BOUND_REQUEST_TYPES = new Set([
+  'REQUEST_SET_TRACK',
 ]);
 
 function toBase64Url(bytes) {
@@ -156,7 +169,7 @@ function buildDefaultNickname() {
   return `Neri${randomId(4)}`;
 }
 
-function buildMember({ userUuid, nickname, role, joinedAt }) {
+function buildMember({ userUuid, nickname, role, joinedAt, memberSecret }) {
   const normalizedUserUuid = normalizeUserUuid(userUuid);
   return {
     userUuid: normalizedUserUuid,
@@ -164,6 +177,7 @@ function buildMember({ userUuid, nickname, role, joinedAt }) {
     nickname: sanitizeNicknameOrNull(nickname) || buildDefaultNickname(),
     role,
     joinedAt: Number(joinedAt) || nowMs(),
+    memberSecret: normalizeOptionalString(memberSecret) || randomMemberSecret(),
   };
 }
 
@@ -175,7 +189,26 @@ function normalizeStoredMember(member, fallbackUserUuid = null) {
     nickname: sanitizeNicknameOrNull(member?.nickname) || sanitizeNicknameOrNull(member?.userId) || fallbackUserUuid,
     role: normalizeOptionalString(member?.role) || 'listener',
     joinedAt: member?.joinedAt,
+    memberSecret: member?.memberSecret,
   });
+}
+
+function memberSecretsMatch(expected, provided) {
+  const expectedValue = String(expected || '');
+  const providedValue = String(provided || '');
+  if (!expectedValue || expectedValue.length !== providedValue.length) return false;
+  let difference = 0;
+  for (let index = 0; index < expectedValue.length; index++) {
+    difference |= expectedValue.charCodeAt(index) ^ providedValue.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+function sanitizeMemberForState(member) {
+  const normalized = normalizeStoredMember(member);
+  if (!normalized) return null;
+  const { memberSecret, ...publicMember } = normalized;
+  return publicMember;
 }
 
 function extractIdentity(body = {}) {
@@ -435,6 +468,7 @@ export class ListeningRoomDO extends DurableObject {
   createEmptyRoom() {
     return {
       roomId: null,
+      joinSecret: null,
       version: 0,
       schemaVersion: 1,
       controllerUserUuid: null,
@@ -475,6 +509,7 @@ export class ListeningRoomDO extends DurableObject {
   async load() {
     const saved = await this.state.storage.get('room');
     if (saved) {
+      const joinSecret = normalizeOptionalString(saved?.joinSecret) || randomRoomJoinSecret();
       const rawMembers = saved?.members && typeof saved.members === 'object' ? saved.members : {};
       const members = {};
       for (const [memberKey, memberValue] of Object.entries(rawMembers)) {
@@ -487,6 +522,7 @@ export class ListeningRoomDO extends DurableObject {
       this.room = {
         ...this.createEmptyRoom(),
         ...saved,
+        joinSecret,
         controllerUserUuid,
         controllerUserId: controllerUserUuid,
         members,
@@ -500,11 +536,14 @@ export class ListeningRoomDO extends DurableObject {
         lastMemberControlRequestSequence: Number(saved?.lastMemberControlRequestSequence) || 0,
         trackFinishBarrier: this.normalizeTrackFinishBarrier(saved?.trackFinishBarrier),
       };
+      if (!normalizeOptionalString(saved?.joinSecret)) {
+        await this.persist();
+      }
     }
   }
 
   makeSessionId(userUuid) {
-    return `${userUuid}:${Math.random().toString(36).slice(2)}`;
+    return `${userUuid}:${randomId(16)}`;
   }
 
   buildSocketAttachment(sessionId, auth) {
@@ -581,7 +620,7 @@ export class ListeningRoomDO extends DurableObject {
         autoPauseOnMemberChange: true,
         shareAudioLinks: true,
       },
-      members: Object.values(this.room.members).map((member) => normalizeStoredMember(member)).filter(Boolean),
+      members: Object.values(this.room.members).map(sanitizeMemberForState).filter(Boolean),
       queue: this.room.queue,
       currentIndex: this.room.currentIndex,
       track: this.room.track,
@@ -922,20 +961,15 @@ export class ListeningRoomDO extends DurableObject {
   sanitizeForwardedControlPayload(event, effectiveType) {
     const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
     const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
-    const shouldUseRequesterQueue = effectiveType === 'SET_TRACK';
+    const shouldSelectExistingTrack = effectiveType === 'SET_TRACK';
     const requestedStableKey = requestedStableKeyFromRequesterEvent(event);
-    const nextQueue = shouldUseRequesterQueue && Array.isArray(event.queue)
-      ? sanitizeQueue(event.queue)
-      : fallbackQueue;
-    const nextIndex = shouldUseRequesterQueue
-      ? normalizeIndex(
-          event.currentIndex,
-          nextQueue.length,
-          normalizeIndex(event.currentIndex, fallbackQueue.length, fallbackIndex)
-        )
-      : fallbackIndex;
-    const nextTrack = shouldUseRequesterQueue
-      ? sanitizeTrack(event.track) || nextQueue[nextIndex] || this.currentTrack()
+    const requestedIndex = shouldSelectExistingTrack
+      ? fallbackQueue.findIndex((track) => track?.stableKey === requestedStableKey)
+      : -1;
+    const nextQueue = fallbackQueue;
+    const nextIndex = requestedIndex >= 0 ? requestedIndex : fallbackIndex;
+    const nextTrack = shouldSelectExistingTrack
+      ? nextQueue[nextIndex] || this.currentTrack()
       : this.currentTrack() || nextQueue[nextIndex] || null;
     const nextPositionMs = Math.max(0, Number(event.positionMs ?? this.expectedPosition()));
     const nextState =
@@ -965,18 +999,28 @@ export class ListeningRoomDO extends DurableObject {
   }
 
   shouldAcceptTrackBoundRequest(event, type) {
-    if (!TRACK_BOUND_REQUEST_TYPES.has(type)) {
-      return { ok: true };
-    }
-    const currentStableKey = this.currentTrackStableKey();
     const requestedStableKey = requestedStableKeyFromRequesterEvent(event);
-    if (requestedStableKey && currentStableKey && requestedStableKey === currentStableKey) {
-      return { ok: true };
+    if (TRACK_BOUND_REQUEST_TYPES.has(type)) {
+      const currentStableKey = this.currentTrackStableKey();
+      if (requestedStableKey && currentStableKey && requestedStableKey === currentStableKey) {
+        return { ok: true };
+      }
+      return {
+        ok: false,
+        error: 'member control target mismatch',
+      };
     }
-    return {
-      ok: false,
-      error: 'member control target mismatch',
-    };
+    if (TRACK_QUEUE_BOUND_REQUEST_TYPES.has(type)) {
+      if (!requestedStableKey) {
+        return { ok: false, error: 'missing member control target' };
+      }
+      const queue = Array.isArray(this.room.queue) ? this.room.queue : [];
+      if (queue.some((track) => track?.stableKey === requestedStableKey)) {
+        return { ok: true };
+      }
+      return { ok: false, error: 'member control target unavailable' };
+    }
+    return { ok: true };
   }
 
   shouldAcceptRequestedControl() {
@@ -1473,11 +1517,21 @@ export class ListeningRoomDO extends DurableObject {
       const userUuid = normalizeUserUuid(parsed.userUuid || parsed.userId);
       const nickname = sanitizeNicknameOrNull(parsed.nickname);
       if (validateRoomId(roomId) || validateUserUuid(userUuid)) return null;
-      if (parsed.expiresAt && Number(parsed.expiresAt) < nowMs()) return null;
+      const expiresAt = Number(parsed.expiresAt);
+      if (!Number.isFinite(expiresAt) || expiresAt <= nowMs()) return null;
       return { ...parsed, roomId, userUuid, userId: userUuid, nickname };
     } catch {
       return null;
     }
+  }
+
+  async authenticateMember(request) {
+    const token = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || '';
+    const auth = token ? await this.parseToken(token) : null;
+    if (!auth || auth.roomId !== this.room.roomId) return null;
+    const member = this.room.members[auth.userUuid];
+    if (!member || member.role !== auth.role) return null;
+    return auth;
   }
 
   async fetch(request) {
@@ -1496,9 +1550,13 @@ export class ListeningRoomDO extends DurableObject {
       if (userUuidError) return json({ ok: false, error: userUuidError }, 400);
       const nicknameError = validateNickname(normalizedNickname);
       if (nicknameError) return json({ ok: false, error: nicknameError }, 400);
+      if (this.room.roomId) {
+        return json({ ok: false, error: 'room already initialized' }, 409);
+      }
       if (!this.room.roomId) {
         const snapshot = this.sanitizeInitialSnapshot(initialSnapshot);
         this.room.roomId = normalizedRoomId;
+        this.room.joinSecret = randomRoomJoinSecret();
         this.room.controllerUserUuid = normalizedUserUuid;
         this.room.controllerUserId = normalizedUserUuid;
         this.room.schemaVersion = 1;
@@ -1520,22 +1578,46 @@ export class ListeningRoomDO extends DurableObject {
         await this.persist();
         await this.scheduleLifecycleAlarm();
       }
+      const controllerMember = this.room.members[normalizedUserUuid];
       const token = await this.makeToken({ roomId: normalizedRoomId, userUuid: normalizedUserUuid, nickname: normalizedNickname, role: 'controller' });
-      return json({ ok: true, roomId: normalizedRoomId, userUuid: normalizedUserUuid, userId: normalizedUserUuid, nickname: normalizedNickname, role: 'controller', token, state: this.sanitizeRoomState() });
+      return json({ ok: true, roomId: normalizedRoomId, userUuid: normalizedUserUuid, userId: normalizedUserUuid, nickname: normalizedNickname, role: 'controller', memberSecret: controllerMember?.memberSecret || null, joinSecret: this.room.joinSecret, token, state: this.sanitizeRoomState() });
     }
 
     if (request.method === 'POST' && path === '/join') {
       const body = await request.json().catch(() => ({}));
       const identity = extractIdentity(body);
+      const suppliedMemberSecret = normalizeOptionalString(body.memberSecret);
+      const suppliedJoinSecret = normalizeOptionalString(body.joinSecret);
       const userUuidError = validateUserUuid(identity.userUuid);
       if (userUuidError) return json({ ok: false, error: userUuidError }, 400);
       const nicknameError = validateNickname(identity.nickname);
       if (nicknameError) return json({ ok: false, error: nicknameError }, 400);
       if (!this.room.roomId) return json({ ok: false, error: 'room not initialized' }, 404);
       if (this.room.roomStatus === 'closed') return json({ ok: false, error: 'room closed' }, 410);
+      const existingMember = this.room.members[identity.userUuid];
+      const bearerToken = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || '';
+      const bearerAuth = bearerToken ? await this.parseToken(bearerToken) : null;
+      const bearerMatchesIdentity = Boolean(
+        existingMember &&
+        bearerAuth?.roomId === this.room.roomId &&
+        bearerAuth.userUuid === identity.userUuid &&
+        bearerAuth.role === existingMember.role
+      );
+      if (existingMember && !memberSecretsMatch(existingMember.memberSecret, suppliedMemberSecret) && !bearerMatchesIdentity) {
+        return json({ ok: false, error: 'member_secret_required' }, 403);
+      }
+      if (!existingMember && !memberSecretsMatch(this.room.joinSecret, suppliedJoinSecret)) {
+        return json({ ok: false, error: 'join_secret_required' }, 403);
+      }
       const role = identity.userUuid === this.room.controllerUserUuid ? 'controller' : 'listener';
       const hadTrackFinishBarrier = Boolean(this.room.trackFinishBarrier);
-      this.room.members[identity.userUuid] = buildMember({ userUuid: identity.userUuid, nickname: identity.nickname, role, joinedAt: nowMs() });
+      this.room.members[identity.userUuid] = buildMember({
+        userUuid: identity.userUuid,
+        nickname: identity.nickname,
+        role,
+        joinedAt: existingMember?.joinedAt || nowMs(),
+        memberSecret: existingMember?.memberSecret || suppliedMemberSecret,
+      });
       this.room.version += 1;
       const memberChangeVersion = this.room.version;
       await this.persist();
@@ -1560,6 +1642,7 @@ export class ListeningRoomDO extends DurableObject {
         );
       }
       const token = await this.makeToken({ roomId: this.room.roomId, userUuid: identity.userUuid, nickname: identity.nickname, role });
+      const memberSecret = this.room.members[identity.userUuid]?.memberSecret || null;
       return json({
         ok: true,
         roomId: this.room.roomId,
@@ -1567,6 +1650,8 @@ export class ListeningRoomDO extends DurableObject {
         userId: identity.userUuid,
         nickname: identity.nickname,
         role,
+        memberSecret,
+        joinSecret: this.room.joinSecret,
         autoPauseOnJoin: this.room.settings?.autoPauseOnMemberChange === true,
         token,
         state: this.sanitizeRoomState(),
@@ -1576,6 +1661,8 @@ export class ListeningRoomDO extends DurableObject {
 
     if (request.method === 'GET' && path === '/state') {
       if (!this.room.roomId) return json({ ok: false, error: 'room not initialized' }, 404);
+      const auth = await this.authenticateMember(request);
+      if (!auth) return json({ ok: false, error: 'unauthorized' }, 401);
       return json({
         ok: true,
         state: this.sanitizeRoomState(),
@@ -1586,9 +1673,8 @@ export class ListeningRoomDO extends DurableObject {
     }
 
     if (request.method === 'POST' && path === '/control') {
-      const token = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || '';
-      const auth = await this.parseToken(token);
-      if (!auth || auth.roomId !== this.room.roomId) return json({ ok: false, error: 'unauthorized' }, 401);
+      const auth = await this.authenticateMember(request);
+      if (!auth) return json({ ok: false, error: 'unauthorized' }, 401);
       if (this.room.roomStatus === 'closed') return json({ ok: false, error: 'room closed' }, 410);
 
       const event = await request.json().catch(() => ({}));
@@ -1600,6 +1686,10 @@ export class ListeningRoomDO extends DurableObject {
       const token = url.searchParams.get('token') || '';
       const auth = await this.parseToken(token);
       if (!auth || auth.roomId !== this.room.roomId) return json({ ok: false, error: 'unauthorized' }, 401);
+      const member = this.room.members[auth.userUuid];
+      if (!member || member.role !== auth.role) {
+        return json({ ok: false, error: 'member not in room' }, 401);
+      }
       if (this.room.roomStatus === 'closed') return json({ ok: false, error: 'room closed' }, 410);
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
