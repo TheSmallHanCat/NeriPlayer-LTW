@@ -10,12 +10,16 @@
 
 - 创建房间 / 加入房间，并直接返回可用的 `wsUrl`
 - 控制者 / 听众双角色与 HMAC Token 鉴权
+- 邀请链接携带首次加入所需的 `joinSecret`；已有成员重连使用自己的
+  `memberSecret`，这些密钥不会写入脱敏房间状态
 - WebSocket 实时同步播放状态、队列、切歌、循环模式、随机播放和房间设置
 - 听众可发起控制请求，由 Worker 校验房间策略、房主在线状态和目标歌曲后直接提交
 - 可选共享房主解析出的播放直链，减少听众端重复取流压力；
   关闭 `shareAudioLinks` 后会立刻清空房间里已缓存的直链
 - 房间状态持久化、控制者离线检测与自动关房
 - 成员进出房间时可自动暂停，避免多人状态失步
+- 控制事件可携带 `clientInstanceId`、`clientSequence`、`clientTimeMs`，Worker 会
+  过滤过期顺序；WebSocket 支持 `np_ping` / `np_pong` 返回服务端时钟
 - 支持 `Deploy to Cloudflare` 一键部署或本地源码手动部署
 
 ## 适合场景
@@ -44,7 +48,7 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - `POST /api/rooms`：创建房间
 - `POST /api/rooms/:roomId/join`：加入房间
 - `GET /api/rooms/:roomId/state`：获取房间快照
-- `POST /api/rooms/:roomId/control`：通过 Bearer Token 提交控制事件
+- `POST /api/rooms/:roomId/control`：通过 `Authorization: Bearer <token>` 提交控制事件
 - `GET /api/rooms/:roomId/ws?token=...`：建立 WebSocket
 - `GET /healthz`：健康检查
 
@@ -84,7 +88,8 @@ Worker 只负责房间状态、权限、队列和同步事件。
 `REQUEST_SEEK` 和 `REQUEST_PLAYBACK_MODE` 必须携带能匹配当前歌曲的
 `requestTrackStableKey`（也可从事件里的 `track` 或 `queue[currentIndex]` 推导），
 避免延迟请求误操作已经切换的歌曲。`REQUEST_SET_TRACK` 只能选择服务端当前队列
-中已有的曲目，成员携带的队列不会写入房态。
+中已有的曲目，成员携带的队列不会写入房态。控制事件如果带有同一客户端实例的
+`clientSequence` 或较旧的 `clientTimeMs`，也会被 Worker 丢弃。
 
 ### 其他事件
 
@@ -110,6 +115,8 @@ Worker 只负责房间状态、权限、队列和同步事件。
 - `REQUEST_LINK` 在 `shareAudioLinks=false` 时会直接失败，返回
   `audio link sharing disabled`
 - Token 有效期为 **24 小时**，由 `LISTEN_TOGETHER_TOKEN_SECRET` 参与 HMAC 签名
+- `/state` 与 `/control` 都需要有效的 `Authorization: Bearer <token>`；WebSocket
+  连接使用返回的 `wsUrl` 中的 token
 - 队列上限为 **2000** 首，避免房间状态无限膨胀
 - 控制者心跳超过 **45 秒**未更新后房间会进入挂起状态；控制者在 **10 分钟**
   宽限期内重连可恢复房间，超时后房间自动关闭并清理 Durable Object 存储
@@ -117,9 +124,9 @@ Worker 只负责房间状态、权限、队列和同步事件。
 ## 安全与隐私边界
 
 - Worker 不存储平台 Cookie、账号密码或 GitHub/WebDAV 凭据
-- WebSocket Token 只用于房间控制鉴权，不代表第三方音乐平台授权
-- `GET /api/rooms/:roomId/state` 当前是无需 Token 的只读快照接口；如需限制房间
-  状态可见性，请在自建实例前增加 Cloudflare Access 或等效访问控制
+- HTTP/WS Token 只用于房间控制鉴权，不代表第三方音乐平台授权
+- `GET /api/rooms/:roomId/state` 需要房间成员的 Bearer Token；健康检查 `/healthz`
+  仍保持公开
 - `shareAudioLinks` 开启时会同步房主解析出的播放直链，请只在可信房间使用
 - 自建实例的日志、访问控制和域名策略由部署者自己负责
 
@@ -143,6 +150,10 @@ npm ci
 npm run check
 npx wrangler dev
 ```
+
+`npm run check` 会依次执行 `node --check src/worker.js`、协议契约测试和
+`wrangler deploy --dry-run`。它不替代真实 Cloudflare 环境中的 create/join/WebSocket
+流程验证。
 
 本地开发可复制 `.dev.vars.example` 为 `.dev.vars`，并填入
 `LISTEN_TOGETHER_TOKEN_SECRET`。建议使用下面的命令生成密钥：
