@@ -247,6 +247,21 @@ function normalizeRepeatMode(value, fallback = 0) {
   return fallback;
 }
 
+const REPEAT_MODE_ONE = 1;
+
+function wrapSingleTrackRepeatPosition(positionMs, playback, track) {
+  const normalizedPositionMs = Math.max(0, Math.floor(Number(positionMs) || 0));
+  const durationMs = Number(track?.durationMs);
+  if (
+    playback?.repeatMode !== REPEAT_MODE_ONE ||
+    !Number.isFinite(durationMs) ||
+    durationMs <= 0
+  ) {
+    return normalizedPositionMs;
+  }
+  return normalizedPositionMs % Math.floor(durationMs);
+}
+
 function normalizeIndex(index, queueLength, fallback = 0) {
   const safeFallback = Number.isInteger(fallback) ? fallback : 0;
   if (queueLength <= 0) return 0;
@@ -708,7 +723,13 @@ export class ListeningRoomDO extends DurableObject {
   expectedPosition(atMs = nowMs()) {
     const p = this.room.playback;
     if (p.state !== 'playing') return p.basePositionMs;
-    return Math.max(0, Math.floor(p.basePositionMs + (atMs - p.baseTimestampMs) * (p.playbackRate || 1)));
+    const projectedPositionMs = p.basePositionMs +
+      (atMs - p.baseTimestampMs) * (p.playbackRate || 1);
+    return wrapSingleTrackRepeatPosition(
+      projectedPositionMs,
+      p,
+      this.currentTrack()
+    );
   }
 
   async persist() {
