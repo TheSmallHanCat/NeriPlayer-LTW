@@ -1,7 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import {
-  cacheStreamUrl,
-  cachedStreamUrlForTrack,
+  MAX_STREAM_URL_CANDIDATES,
+  cacheStreamUrls,
+  cachedStreamUrlsForTrack,
   normalizeStreamUrlCache,
   publicRoomStateWithCurrentStreamUrl,
 } from './stream-url-cache.js';
@@ -268,6 +269,17 @@ function normalizeHttpUrl(value) {
   return null;
 }
 
+function normalizeHttpUrls(values) {
+  if (!Array.isArray(values)) return [];
+  const urls = [];
+  for (const value of values) {
+    const url = normalizeHttpUrl(value);
+    if (url && !urls.includes(url)) urls.push(url);
+    if (urls.length >= MAX_STREAM_URL_CANDIDATES) break;
+  }
+  return urls;
+}
+
 function sanitizeTrack(track) {
   if (!isPlainObject(track)) return null;
   const stableKey = normalizeOptionalString(track.stableKey);
@@ -278,6 +290,10 @@ function sanitizeTrack(track) {
   if (!stableKey || !channelId || !audioId || !name || !artist) return null;
   if (channelId.toLowerCase() === 'local') return null;
   const durationMs = Number.isFinite(Number(track.durationMs)) ? Math.max(0, Math.floor(Number(track.durationMs))) : 0;
+  const streamUrls = normalizeHttpUrls([
+    ...(Array.isArray(track.streamUrls) ? track.streamUrls : []),
+    track.streamUrl,
+  ]);
   return {
     stableKey,
     channelId,
@@ -285,7 +301,8 @@ function sanitizeTrack(track) {
     subAudioId: normalizeOptionalString(track.subAudioId),
     playlistContextId: normalizeOptionalString(track.playlistContextId),
     mediaUri: normalizeOptionalString(track.mediaUri),
-    streamUrl: normalizeHttpUrl(track.streamUrl),
+    streamUrl: streamUrls[0] || null,
+    streamUrls,
     name,
     artist,
     album: normalizeOptionalString(track.album),
@@ -315,7 +332,7 @@ function sanitizeQueue(queue) {
 }
 
 function stripTrackAudioLink(track) {
-  return track ? { ...track, streamUrl: null } : track;
+  return track ? { ...track, streamUrl: null, streamUrls: [] } : track;
 }
 
 function requestedStableKeyForEvent(event, queue, currentIndex, track) {
@@ -528,10 +545,10 @@ export class ListeningRoomDO extends DurableObject {
         : selectedQueueTrack;
       let streamUrlCache = normalizeStreamUrlCache(saved?.streamUrlCache);
       if (settings.shareAudioLinks) {
-        streamUrlCache = cacheStreamUrl(
+        streamUrlCache = cacheStreamUrls(
           streamUrlCache,
           track?.stableKey,
-          track?.streamUrl,
+          track?.streamUrls,
           saved?.updatedAt
         );
       } else {
@@ -568,7 +585,8 @@ export class ListeningRoomDO extends DurableObject {
         lastMemberControlRequestSequence: Number(saved?.lastMemberControlRequestSequence) || 0,
         trackFinishBarrier: this.normalizeTrackFinishBarrier(saved?.trackFinishBarrier),
       };
-      const hadStoredAudioLink = queue.some((item) => item.streamUrl) || Boolean(savedTrack?.streamUrl);
+      const hadStoredAudioLink = queue.some((item) => item.streamUrls?.length) ||
+        Boolean(savedTrack?.streamUrls?.length);
       const hadStoredLocalTrack = eventContainsLocalTrack(saved);
       const cacheChanged = JSON.stringify(streamUrlCache) !== JSON.stringify(saved?.streamUrlCache || {});
       if (!normalizeOptionalString(saved?.joinSecret) || hadStoredAudioLink || hadStoredLocalTrack || cacheChanged) {
@@ -672,12 +690,12 @@ export class ListeningRoomDO extends DurableObject {
       const currentTrack = this.currentTrack();
       const queueTrack = this.room.queue[this.room.currentIndex] || null;
       const candidate = [this.room.track, queueTrack].find((track) =>
-        track?.stableKey === currentTrack?.stableKey && track.streamUrl
+        track?.stableKey === currentTrack?.stableKey && track.streamUrls?.length
       );
-      this.room.streamUrlCache = cacheStreamUrl(
+      this.room.streamUrlCache = cacheStreamUrls(
         this.room.streamUrlCache,
         currentTrack?.stableKey,
-        candidate?.streamUrl
+        candidate?.streamUrls
       );
     } else {
       this.room.streamUrlCache = {};
@@ -715,15 +733,6 @@ export class ListeningRoomDO extends DurableObject {
     this.room.processedEventIds = next;
   }
 
-  hasActiveControllerSession() {
-    for (const { auth } of this.sessions.values()) {
-      if (auth.userUuid === this.room.controllerUserUuid) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   controllerSessions() {
     const results = [];
     for (const session of this.sessions.values()) {
@@ -750,6 +759,18 @@ export class ListeningRoomDO extends DurableObject {
 
   refreshControllerHeartbeat() {
     this.room.controllerHeartbeatAt = nowMs();
+  }
+
+  async refreshControllerHeartbeatForSocket(session) {
+    if (session?.auth?.userUuid !== this.room.controllerUserUuid) return;
+    if (this.room.roomStatus === 'closed') return;
+    this.refreshControllerHeartbeat();
+    if (this.room.roomStatus === 'controller_offline') {
+      await this.markControllerOnline();
+      return;
+    }
+    await this.persist();
+    await this.scheduleLifecycleAlarm();
   }
 
   controllerHeartbeatDeadline() {
@@ -1032,14 +1053,15 @@ export class ListeningRoomDO extends DurableObject {
   sanitizeForwardedControlPayload(event, effectiveType) {
     const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
     const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
-    const shouldSelectExistingTrack = effectiveType === 'SET_TRACK';
+    const requesterQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : [];
+    const shouldReplaceQueue = effectiveType === 'SET_TRACK' && requesterQueue.length > 0;
     const requestedStableKey = requestedStableKeyFromRequesterEvent(event);
-    const requestedIndex = shouldSelectExistingTrack
-      ? fallbackQueue.findIndex((track) => track?.stableKey === requestedStableKey)
+    const nextQueue = shouldReplaceQueue ? requesterQueue : fallbackQueue;
+    const requestedIndex = effectiveType === 'SET_TRACK'
+      ? nextQueue.findIndex((track) => track?.stableKey === requestedStableKey)
       : -1;
-    const nextQueue = fallbackQueue;
     const nextIndex = requestedIndex >= 0 ? requestedIndex : fallbackIndex;
-    const nextTrack = shouldSelectExistingTrack
+    const nextTrack = effectiveType === 'SET_TRACK'
       ? nextQueue[nextIndex] || this.currentTrack()
       : this.currentTrack() || nextQueue[nextIndex] || null;
     const nextPositionMs = Math.max(0, Number(event.positionMs ?? this.expectedPosition()));
@@ -1085,8 +1107,18 @@ export class ListeningRoomDO extends DurableObject {
       if (!requestedStableKey) {
         return { ok: false, error: 'missing member control target' };
       }
-      const queue = Array.isArray(this.room.queue) ? this.room.queue : [];
-      if (queue.some((track) => track?.stableKey === requestedStableKey)) {
+      if (Array.isArray(event.queue)) {
+        const requesterQueue = sanitizeQueue(event.queue);
+        if (!requesterQueue.length) {
+          return { ok: false, error: 'member control queue unavailable' };
+        }
+        if (requesterQueue.some((track) => track?.stableKey === requestedStableKey)) {
+          return { ok: true };
+        }
+        return { ok: false, error: 'member control target unavailable' };
+      }
+      const roomQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
+      if (roomQueue.some((track) => track?.stableKey === requestedStableKey)) {
         return { ok: true };
       }
       return { ok: false, error: 'member control target unavailable' };
@@ -1381,14 +1413,14 @@ export class ListeningRoomDO extends DurableObject {
       if (!currentStableKey || targetStableKey !== currentStableKey) {
         return { ok: false, error: 'link target does not match current track' };
       }
-      const streamUrl = sanitizedEventTrack?.streamUrl;
-      if (!streamUrl) {
-        return { ok: false, error: 'missing direct stream URL' };
+      const streamUrls = sanitizedEventTrack?.streamUrls || [];
+      if (!streamUrls.length) {
+        return { ok: false, error: 'missing direct stream URLs' };
       }
-      this.room.streamUrlCache = cacheStreamUrl(
+      this.room.streamUrlCache = cacheStreamUrls(
         this.room.streamUrlCache,
         targetStableKey,
-        streamUrl,
+        streamUrls,
         committedAt
       );
     } else if (effectiveType === 'SET_TRACK') {
@@ -1473,16 +1505,6 @@ export class ListeningRoomDO extends DurableObject {
       causedBy: payload.causedBy,
     });
     return { ok: true, applied: payload };
-  }
-
-  hasActiveUserSession(userUuid, excludeSessionId = null) {
-    for (const [sessionId, session] of this.sessions.entries()) {
-      if (sessionId === excludeSessionId) continue;
-      if (session.auth.userUuid === userUuid) {
-        return true;
-      }
-    }
-    return false;
   }
 
   shouldSkipMemberChangeAutoPause(expectedVersion) {
@@ -1702,7 +1724,8 @@ export class ListeningRoomDO extends DurableObject {
         return json({ ok: false, error: 'join_secret_required' }, 403);
       }
       const role = identity.userUuid === this.room.controllerUserUuid ? 'controller' : 'listener';
-      const hadTrackFinishBarrier = Boolean(this.room.trackFinishBarrier);
+      const isNewMember = !existingMember;
+      const nicknameChanged = existingMember?.nickname !== identity.nickname;
       this.room.members[identity.userUuid] = buildMember({
         userUuid: identity.userUuid,
         nickname: identity.nickname,
@@ -1710,28 +1733,30 @@ export class ListeningRoomDO extends DurableObject {
         joinedAt: existingMember?.joinedAt || nowMs(),
         memberSecret: existingMember?.memberSecret || suppliedMemberSecret,
       });
-      this.room.version += 1;
-      const memberChangeVersion = this.room.version;
-      await this.persist();
-      await this.broadcastRoomState(
-        'room_state_updated',
-        {
-          userUuid: identity.userUuid,
-          userId: identity.userUuid,
-          nickname: identity.nickname,
-          eventId: null,
-          type: 'MEMBER_JOINED',
-        },
-        `member_joined:${identity.nickname}`
-      );
-      if (!hadTrackFinishBarrier) {
-        await this.pauseForMemberChange(
-          `member_joined:${identity.nickname}`,
-          identity.userUuid,
-          identity.nickname,
-          'MEMBER_JOINED',
-          memberChangeVersion
+      if (isNewMember || nicknameChanged) {
+        this.room.version += 1;
+        const memberChangeVersion = this.room.version;
+        await this.persist();
+        await this.broadcastRoomState(
+          'room_state_updated',
+          {
+            userUuid: identity.userUuid,
+            userId: identity.userUuid,
+            nickname: identity.nickname,
+            eventId: null,
+            type: isNewMember ? 'MEMBER_JOINED' : 'MEMBER_REJOINED',
+          },
+          isNewMember ? `member_joined:${identity.nickname}` : `member_rejoined:${identity.nickname}`
         );
+        if (isNewMember && !this.room.trackFinishBarrier) {
+          await this.pauseForMemberChange(
+            `member_joined:${identity.nickname}`,
+            identity.userUuid,
+            identity.nickname,
+            'MEMBER_JOINED',
+            memberChangeVersion
+          );
+        }
       }
       const token = await this.makeToken({ roomId: this.room.roomId, userUuid: identity.userUuid, nickname: identity.nickname, role });
       const memberSecret = this.room.members[identity.userUuid]?.memberSecret || null;
@@ -1744,7 +1769,7 @@ export class ListeningRoomDO extends DurableObject {
         role,
         memberSecret,
         joinSecret: this.room.joinSecret,
-        autoPauseOnJoin: this.room.settings?.autoPauseOnMemberChange === true,
+        autoPauseOnJoin: isNewMember && this.room.settings?.autoPauseOnMemberChange === true,
         token,
         state: this.sanitizeRoomState(),
         wsUrl: buildWsUrl(request.url, this.room.roomId, token),
@@ -1795,10 +1820,7 @@ export class ListeningRoomDO extends DurableObject {
   async handleWsSession(ws, auth) {
     this.state.acceptWebSocket(ws);
     const session = this.rememberSocketSession(ws, auth);
-    if (session.auth.userUuid === this.room.controllerUserUuid) {
-      this.refreshControllerHeartbeat();
-      await this.markControllerOnline();
-    }
+    await this.refreshControllerHeartbeatForSocket(session);
 
     ws.send(JSON.stringify({
       type: 'welcome',
@@ -1819,47 +1841,19 @@ export class ListeningRoomDO extends DurableObject {
     if (!session) return;
     this.sessions.delete(session.sessionId);
     const auth = session.auth;
-    if (auth.userUuid === this.room.controllerUserUuid && !this.hasActiveControllerSession()) {
-      await this.markControllerOffline();
-      return;
+    // websocket close is transport churn, not an explicit room leave
+    // keeping the credential-bound member avoids a pause when it reconnects
+    if (auth.userUuid === this.room.controllerUserUuid) {
+      await this.scheduleLifecycleAlarm();
     }
-    if (this.room.members[auth.userUuid] && !this.hasActiveUserSession(auth.userUuid, session.sessionId)) {
-      const nickname = this.room.members[auth.userUuid]?.nickname || auth.nickname || auth.userUuid;
-      const hadTrackFinishBarrier = Boolean(this.room.trackFinishBarrier);
-      delete this.room.members[auth.userUuid];
-      this.room.version += 1;
-      const memberChangeVersion = this.room.version;
-      if (hadTrackFinishBarrier && this.isTrackFinishBarrierReady()) {
-        await this.completeTrackFinishBarrier({
-          senderId: auth.userUuid,
-          senderNickname: nickname,
-          role: auth.role,
-          eventId: null,
-          commitAt: nowMs(),
-        });
-        return;
-      }
-      await this.persist();
-      await this.broadcastRoomState(
-        'room_state_updated',
-        {
-          userUuid: auth.userUuid,
-          userId: auth.userUuid,
-          nickname,
-          eventId: null,
-          type: 'MEMBER_LEFT',
-        },
-        `member_left:${nickname}`
-      );
-      if (!hadTrackFinishBarrier) {
-        await this.pauseForMemberChange(
-          `member_left:${nickname}`,
-          auth.userUuid,
-          nickname,
-          'MEMBER_LEFT',
-          memberChangeVersion
-        );
-      }
+    if (this.room.trackFinishBarrier && this.isTrackFinishBarrierReady()) {
+      await this.completeTrackFinishBarrier({
+        senderId: auth.userUuid,
+        senderNickname: auth.nickname || auth.userUuid,
+        role: auth.role,
+        eventId: null,
+        commitAt: nowMs(),
+      });
     }
   }
 
@@ -1876,10 +1870,12 @@ export class ListeningRoomDO extends DurableObject {
       const text = typeof message === 'string' ? message : new TextDecoder().decode(message);
       const msg = JSON.parse(text);
       if (msg.type === 'ping') {
+        await this.refreshControllerHeartbeatForSocket(session);
         ws.send(JSON.stringify({ type: 'pong', nowMs: nowMs() }));
         return;
       }
       if (msg.type === 'np_ping') {
+        await this.refreshControllerHeartbeatForSocket(session);
         ws.send(JSON.stringify({ type: 'np_pong', t: Number(msg.t) || null, nowMs: nowMs() }));
         return;
       }
@@ -1997,7 +1993,7 @@ export class ListeningRoomDO extends DurableObject {
       if (!isController && !this.consumeLinkRequestBudget(senderId, requestTrackStableKey)) {
         return { ok: false, error: 'link request throttled' };
       }
-      if (!event.forceRefresh && cachedStreamUrlForTrack(this.room.streamUrlCache, requestTrackStableKey)) {
+      if (!event.forceRefresh && cachedStreamUrlsForTrack(this.room.streamUrlCache, requestTrackStableKey).length) {
         return this.publishCachedLinkState(senderId, senderNickname, eventId);
       }
       if (this.room.roomStatus === 'controller_offline' && !isController) {

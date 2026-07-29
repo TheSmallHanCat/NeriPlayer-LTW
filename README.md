@@ -14,14 +14,14 @@
   `memberSecret`，这些密钥不会写入脱敏房间状态
 - WebSocket 实时同步播放状态、队列、切歌、循环模式、随机播放和房间设置
 - 听众可发起控制请求，由 Worker 校验房间策略、房主在线状态和目标歌曲后直接提交
-- 可选共享房主解析出的播放直链，减少听众端重复取流压力；Worker 会持久缓存
-  房主当前曲目的直链，缓存命中时听众无需等待房主在线，且只会公开当前曲目的链接
+- 可选共享房主解析出的多个播放直链，减少听众端重复取流压力；Worker 会持久缓存
+  房主当前曲目最多三条有序候选，缓存命中时听众无需等待房主在线，且只会公开当前曲目的链接
 - 本地歌曲不能创建房间或进入同步事件；关闭 `shareAudioLinks` 后会立刻清空
   房间里已缓存的直链
 - 房间状态持久化、控制者离线检测与自动关房
-- 成员进出房间时可自动暂停，避免多人状态失步
+- 新成员加入时可按房间设置自动暂停；同一成员使用 `memberSecret` 或 Token 重连不会触发暂停
 - 控制事件可携带 `clientInstanceId`、`clientSequence`、`clientTimeMs`，Worker 会
-  过滤过期顺序；WebSocket 支持 `np_ping` / `np_pong` 返回服务端时钟
+  过滤过期顺序；WebSocket 支持 `np_ping` / `np_pong` 返回服务端时钟并刷新房主存活时间
 - 支持 `Deploy to Cloudflare` 一键部署或本地源码手动部署
 
 ## 适合场景
@@ -115,9 +115,9 @@ Worker 只负责房间状态、权限、队列和同步事件。
   仍按可选字段兼容
 - 当 `shareAudioLinks=false` 时，HTTP `state` 快照，以及 WebSocket
   `welcome` / `room_state_updated` 消息里的 `state`，都会把
-  `track.streamUrl` 与 `queue[*].streamUrl` 清空为 `null`
+  `track.streamUrl`、`track.streamUrls` 与队列对应字段清空
 - `UPDATE_SETTINGS` 关闭 `shareAudioLinks` 后，会立即清空房间里已缓存的直链
-- 重新开启 `shareAudioLinks` 后，房主客户端会立即重新上传当前歌曲的直链；房态只会
+- 重新开启 `shareAudioLinks` 后，房主客户端会立即重新上传当前歌曲的候选直链；房态只会
   公开当前曲目的缓存链接，历史缓存不会泄漏到队列中的其他歌曲
 - `REQUEST_LINK` 在 `shareAudioLinks=false` 时会直接失败，返回
   `audio link sharing disabled`
