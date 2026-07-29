@@ -36,8 +36,10 @@ expectSetContains('REQUEST_CONTROL_EVENT_TYPES', 'REQUEST_PLAYBACK_MODE');
 expectSourceContains(/const TRACK_BOUND_REQUEST_TYPES = new Set\(\[[\s\S]*'REQUEST_PLAYBACK_MODE'/, 'playback mode current-track binding');
 expectSourceContains(/const TRACK_QUEUE_BOUND_REQUEST_TYPES = new Set\(\[[\s\S]*'REQUEST_SET_TRACK'/, 'set-track queue binding');
 expectSourceContains(/member control target unavailable/, 'set-track existing queue validation');
-expectSourceContains(/const shouldSelectExistingTrack = effectiveType === 'SET_TRACK'/, 'server-owned set-track queue');
-expectSourceContains(/fallbackQueue\.findIndex\(\(track\) => track\?\.stableKey === requestedStableKey\)/, 'stable-key based set-track selection');
+expectSourceContains(/const requesterQueue = Array\.isArray\(event\.queue\) \? sanitizeQueue\(event\.queue\) : \[\];/, 'sanitized requester queue');
+expectSourceContains(/const shouldReplaceQueue = effectiveType === 'SET_TRACK' && requesterQueue\.length > 0;/, 'listener set-track queue adoption');
+expectSourceContains(/const nextQueue = shouldReplaceQueue \? requesterQueue : fallbackQueue;/, 'set-track queue fallback');
+expectSourceContains(/requesterQueue\.some\(\(track\) => track\?\.stableKey === requestedStableKey\)/, 'requester queue target validation');
 expectSourceContains(/clientInstanceId/, 'client instance ordering scope');
 expectSourceContains(/clientSequence/, 'clientSequence ordering support');
 expectSourceContains(/lastControlClientSequences/, 'per-client sequence tracking');
@@ -46,6 +48,8 @@ expectSourceContains(/shouldSkipMemberChangeAutoPause/, 'member-change auto-paus
 expectSourceContains(/memberChangeVersion/, 'member-change version barrier');
 expectSourceContains(/msg\.type === 'np_ping'/, 'custom clock-sync ping handling');
 expectSourceContains(/type: 'np_pong'/, 'custom clock-sync pong handling');
+expectSourceContains(/async refreshControllerHeartbeatForSocket\(session\)/, 'socket heartbeat refresh helper');
+expectSourceContains(/if \(msg\.type === 'np_ping'\) \{\s+await this\.refreshControllerHeartbeatForSocket\(session\);/, 'controller heartbeat refresh on custom ping');
 expectSourceContains(/serverNowMs: nowMs\(\)/, 'HTTP state server clock timestamp');
 expectSourceContains(/nowMs: nowMs\(\)/, 'WebSocket server clock timestamp');
 expectSourceContains(/CONTROLLER_HEARTBEAT_TIMEOUT_MS = 45 \* 1000/, '45 second controller heartbeat timeout');
@@ -65,7 +69,20 @@ expectSourceContains(/ROOM_JOIN_SECRET_BYTES = 32/, 'room invite secret entropy'
 expectSourceContains(/join_secret_required/, 'invite secret rejection');
 expectSourceContains(/crypto\.getRandomValues\(new Uint8Array\(len\)\)/, 'cryptographically random room identifiers');
 expectSourceContains(/streamUrlCache/, 'durable room stream URL cache');
+expectSourceContains(/const isNewMember = !existingMember;/, 'same identity rejoin classification');
+expectSourceContains(/type: isNewMember \? 'MEMBER_JOINED' : 'MEMBER_REJOINED'/, 'rejoin event distinction');
+expectSourceContains(/if \(isNewMember && !this\.room\.trackFinishBarrier\)/, 'no member-change pause on rejoin');
 expectSourceContains(/requested link does not match current track/, 'stale link request rejection');
 expectSourceContains(/link target does not match current track/, 'stale link publication rejection');
 expectSourceContains(/event\.forceRefresh/, 'forced cache bypass for a stalled listener');
 expectSourceContains(/local tracks cannot be shared/, 'local track rejection');
+
+const cleanupSocketSession = workerSource.match(
+  /async cleanupSocketSession\(ws\) \{([\s\S]*?)\n  \}\n\n  async webSocketMessage/
+);
+if (!cleanupSocketSession) {
+  throw new Error('worker must keep websocket cleanup handling');
+}
+if (/delete this\.room\.members/.test(cleanupSocketSession[1])) {
+  throw new Error('websocket cleanup must not remove credential-bound room members');
+}
