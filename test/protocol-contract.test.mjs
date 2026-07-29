@@ -44,6 +44,8 @@ expectSourceContains(/clientInstanceId/, 'client instance ordering scope');
 expectSourceContains(/clientSequence/, 'clientSequence ordering support');
 expectSourceContains(/lastControlClientSequences/, 'per-client sequence tracking');
 expectSourceContains(/shouldDropOutdatedControlEvent/, 'outdated control event gate');
+expectSourceContains(/wrapSingleTrackRepeatPosition/, 'single-track repeat position wrapping');
+expectSourceContains(/playback\?\.repeatMode !== REPEAT_MODE_ONE/, 'single-track repeat mode guard');
 expectSourceContains(/shouldSkipMemberChangeAutoPause/, 'member-change auto-pause guard');
 expectSourceContains(/memberChangeVersion/, 'member-change version barrier');
 expectSourceContains(/msg\.type === 'np_ping'/, 'custom clock-sync ping handling');
