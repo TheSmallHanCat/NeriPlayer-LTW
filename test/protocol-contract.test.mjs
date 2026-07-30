@@ -73,7 +73,12 @@ expectSourceContains(/crypto\.getRandomValues\(new Uint8Array\(len\)\)/, 'crypto
 expectSourceContains(/streamUrlCache/, 'durable room stream URL cache');
 expectSourceContains(/const isNewMember = !existingMember;/, 'same identity rejoin classification');
 expectSourceContains(/type: isNewMember \? 'MEMBER_JOINED' : 'MEMBER_REJOINED'/, 'rejoin event distinction');
-expectSourceContains(/if \(isNewMember && !this\.room\.trackFinishBarrier\)/, 'no member-change pause on rejoin');
+expectSourceContains(/isNewMember\s*&&\s*!this\.room\.trackFinishBarrier\s*&&\s*this\.room\.settings\?\.autoPauseOnMemberChange === true/, 'new-member auto-pause only');
+expectSourceContains(/async leaveMember\(auth\)/, 'explicit member leave handling');
+expectSourceContains(/delete this\.room\.members\[auth\.userUuid\]/, 'explicit member removal');
+expectSourceContains(/type: 'MEMBER_LEFT'/, 'member leave broadcast');
+expectSourceContains(/path === '\/leave'/, 'authenticated leave endpoint');
+expectSourceContains(/shouldIgnoreMemberChangeHeartbeat/, 'member-change heartbeat barrier');
 expectSourceContains(/requested link does not match current track/, 'stale link request rejection');
 expectSourceContains(/link target does not match current track/, 'stale link publication rejection');
 expectSourceContains(/event\.forceRefresh/, 'forced cache bypass for a stalled listener');
