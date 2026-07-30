@@ -46,7 +46,6 @@ const ROOM_JOIN_SECRET_BYTES = 32;
 const MAX_PROCESSED_EVENT_IDS = 256;
 const MAX_QUEUE_SIZE = 2000;
 const LINK_REQUEST_COOLDOWN_MS = 1500;
-const CONTROL_ARBITRATION_WINDOW_MS = 1500;
 const HEARTBEAT_SUPPRESSION_AFTER_MEMBER_CONTROL_MS = 4000;
 const ROOM_ID_LENGTH = 6;
 const NICKNAME_MIN_LENGTH = 1;
@@ -458,7 +457,7 @@ export default {
       return json(payload, doResp.status);
     }
 
-    const match = pathname.match(/^\/api\/rooms\/([^/]+)\/(join|state|control|ws)$/);
+    const match = pathname.match(/^\/api\/rooms\/([^/]+)\/(join|state|control|leave|ws)$/);
     if (match) {
       const [, roomId, action] = match;
       const normalizedRoomId = normalizeRoomId(roomId);
@@ -542,6 +541,7 @@ export class ListeningRoomDO extends DurableObject {
       // legacy relay sequence is kept so older persisted rooms hydrate without migration
       lastMemberControlRequestSequence: 0,
       trackFinishBarrier: null,
+      memberChangePausePending: false,
       updatedAt: nowMs(),
     };
   }
@@ -599,6 +599,7 @@ export class ListeningRoomDO extends DurableObject {
         lastControlClientTimes: normalizeControlOrderMap(saved?.lastControlClientTimes),
         lastMemberControlRequestSequence: Number(saved?.lastMemberControlRequestSequence) || 0,
         trackFinishBarrier: this.normalizeTrackFinishBarrier(saved?.trackFinishBarrier),
+        memberChangePausePending: saved?.memberChangePausePending === true,
       };
       const hadStoredAudioLink = queue.some((item) => item.streamUrls?.length) ||
         Boolean(savedTrack?.streamUrls?.length);
@@ -974,6 +975,10 @@ export class ListeningRoomDO extends DurableObject {
     this.room.trackFinishBarrier = null;
   }
 
+  clearMemberChangePauseBarrier() {
+    this.room.memberChangePausePending = false;
+  }
+
   eventClientSequence(event) {
     return normalizePositiveInteger(event?.clientSequence);
   }
@@ -1169,6 +1174,11 @@ export class ListeningRoomDO extends DurableObject {
     return true;
   }
 
+  shouldIgnoreMemberChangeHeartbeat(event, isController) {
+    if (!isController || !this.room.memberChangePausePending) return false;
+    return normalizePlaybackState(event?.state, this.room.playback.state) === 'playing';
+  }
+
   shouldIgnoreHeartbeatForTrackFinishBarrier(event) {
     const barrier = this.room.trackFinishBarrier;
     if (!barrier?.trackStableKey) return false;
@@ -1233,6 +1243,7 @@ export class ListeningRoomDO extends DurableObject {
     if (!barrier) return this.buildAppliedPayload('TRACK_FINISHED', senderId, eventId, senderNickname);
     const proposal = barrier.controllerProposal;
     this.clearTrackFinishBarrier();
+    this.clearMemberChangePauseBarrier();
     if (proposal?.shouldAdvance && proposal.track) {
       this.room.queue = proposal.queue;
       this.room.currentIndex = normalizeIndex(proposal.currentIndex, proposal.queue.length, this.room.currentIndex);
@@ -1347,6 +1358,9 @@ export class ListeningRoomDO extends DurableObject {
     const committedAt = commitAt || nowMs();
     if (effectiveType !== 'HEARTBEAT' && effectiveType !== 'LINK_READY' && effectiveType !== 'UPDATE_SETTINGS') {
       this.clearTrackFinishBarrier();
+    }
+    if (effectiveType === 'PLAY' || effectiveType === 'SET_TRACK') {
+      this.clearMemberChangePauseBarrier();
     }
     const nextRepeatMode = normalizeRepeatMode(event.repeatMode, this.room.playback.repeatMode ?? 0);
     const nextShuffleEnabled = typeof event.shuffleEnabled === 'boolean'
@@ -1531,14 +1545,12 @@ export class ListeningRoomDO extends DurableObject {
   shouldSkipMemberChangeAutoPause(expectedVersion) {
     if (this.room.settings?.autoPauseOnMemberChange !== true) return true;
     if (expectedVersion != null && this.room.version !== expectedVersion) return true;
-    const lastAt = Number(this.room.lastControlCommittedAt) || 0;
-    return this.room.lastControlCommittedRole === 'controller' &&
-      this.room.lastControlCommittedType === 'PLAY' &&
-      nowMs() - lastAt < CONTROL_ARBITRATION_WINDOW_MS;
+    return false;
   }
 
   async pauseForMemberChange(message, userUuid, nickname, causedByType, expectedVersion = null) {
-    if (this.shouldSkipMemberChangeAutoPause(expectedVersion)) return;
+    if (this.shouldSkipMemberChangeAutoPause(expectedVersion)) return false;
+    this.room.memberChangePausePending = true;
     this.room.playback = {
       ...this.room.playback,
       state: 'paused',
@@ -1558,6 +1570,43 @@ export class ListeningRoomDO extends DurableObject {
       },
       message
     );
+    return true;
+  }
+
+  async leaveMember(auth) {
+    if (auth.userUuid === this.room.controllerUserUuid) {
+      await this.closeRoom('controller_left');
+      return { ok: true };
+    }
+
+    const member = this.room.members[auth.userUuid];
+    if (!member) return { ok: false, error: 'member not in room' };
+    const nickname = member.nickname || auth.nickname || auth.userUuid;
+    delete this.room.members[auth.userUuid];
+    this.room.version += 1;
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (session.auth.userUuid !== auth.userUuid) continue;
+      this.sessions.delete(sessionId);
+      try {
+        session.ws.close(4000, 'member_left');
+      } catch {}
+    }
+    await this.persist();
+    await this.broadcastRoomState(
+      'room_state_updated',
+      {
+        userUuid: auth.userUuid,
+        userId: auth.userUuid,
+        nickname,
+        eventId: null,
+        type: 'MEMBER_LEFT',
+      },
+      `member_left:${nickname}`
+    );
+    return {
+      ok: true,
+      applied: this.buildAppliedPayload('MEMBER_LEFT', auth.userUuid, null, nickname),
+    };
   }
 
   async closeRoom(reason = 'controller_timeout') {
@@ -1757,25 +1806,44 @@ export class ListeningRoomDO extends DurableObject {
       if (isNewMember || nicknameChanged) {
         this.room.version += 1;
         const memberChangeVersion = this.room.version;
-        await this.persist();
-        await this.broadcastRoomState(
-          'room_state_updated',
-          {
-            userUuid: identity.userUuid,
-            userId: identity.userUuid,
-            nickname: identity.nickname,
-            eventId: null,
-            type: isNewMember ? 'MEMBER_JOINED' : 'MEMBER_REJOINED',
-          },
-          isNewMember ? `member_joined:${identity.nickname}` : `member_rejoined:${identity.nickname}`
-        );
-        if (isNewMember && !this.room.trackFinishBarrier) {
-          await this.pauseForMemberChange(
+        if (
+          isNewMember &&
+          !this.room.trackFinishBarrier &&
+          this.room.settings?.autoPauseOnMemberChange === true
+        ) {
+          const paused = await this.pauseForMemberChange(
             `member_joined:${identity.nickname}`,
             identity.userUuid,
             identity.nickname,
             'MEMBER_JOINED',
             memberChangeVersion
+          );
+          if (!paused) {
+            await this.persist();
+            await this.broadcastRoomState(
+              'room_state_updated',
+              {
+                userUuid: identity.userUuid,
+                userId: identity.userUuid,
+                nickname: identity.nickname,
+                eventId: null,
+                type: 'MEMBER_JOINED',
+              },
+              `member_joined:${identity.nickname}`
+            );
+          }
+        } else {
+          await this.persist();
+          await this.broadcastRoomState(
+            'room_state_updated',
+            {
+              userUuid: identity.userUuid,
+              userId: identity.userUuid,
+              nickname: identity.nickname,
+              eventId: null,
+              type: isNewMember ? 'MEMBER_JOINED' : 'MEMBER_REJOINED',
+            },
+            isNewMember ? `member_joined:${identity.nickname}` : `member_rejoined:${identity.nickname}`
           );
         }
       }
@@ -1808,6 +1876,15 @@ export class ListeningRoomDO extends DurableObject {
         serverNowMs: nowMs(),
         autoPauseOnJoin: this.room.settings?.autoPauseOnMemberChange === true,
       });
+    }
+
+    if (request.method === 'POST' && path === '/leave') {
+      if (!this.room.roomId) return json({ ok: false, error: 'room not initialized' }, 404);
+      const auth = await this.authenticateMember(request);
+      if (!auth) return json({ ok: false, error: 'unauthorized' }, 401);
+      if (this.room.roomStatus === 'closed') return json({ ok: false, error: 'room closed' }, 410);
+      const result = await this.leaveMember(auth);
+      return json(result, result.ok ? 200 : 400);
     }
 
     if (request.method === 'POST' && path === '/control') {
@@ -2101,6 +2178,21 @@ export class ListeningRoomDO extends DurableObject {
       });
     }
     if (effectiveType === 'HEARTBEAT' && this.shouldIgnoreHeartbeatForTrackFinishBarrier(event)) {
+      if (isController) {
+        this.refreshControllerHeartbeat();
+      }
+      this.markProcessedEvent(eventId);
+      await this.persist();
+      await this.scheduleLifecycleAlarm();
+      return {
+        ok: true,
+        applied: this.buildAppliedPayload(type, senderId, eventId, senderNickname),
+      };
+    }
+    if (
+      effectiveType === 'HEARTBEAT' &&
+      this.shouldIgnoreMemberChangeHeartbeat(event, isController)
+    ) {
       if (isController) {
         this.refreshControllerHeartbeat();
       }
