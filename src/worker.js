@@ -67,6 +67,7 @@ const ALLOWED_EVENT_TYPES = new Set([
   'REQUEST_SEEK',
   'REQUEST_PLAYBACK_MODE',
   'REQUEST_SET_TRACK',
+  'REQUEST_SET_QUEUE',
   'HEARTBEAT',
   'TRACK_FINISHED',
   'REQUEST_LINK',
@@ -89,6 +90,7 @@ const REQUEST_CONTROL_EVENT_TYPES = new Set([
   'REQUEST_SEEK',
   'REQUEST_PLAYBACK_MODE',
   'REQUEST_SET_TRACK',
+  'REQUEST_SET_QUEUE',
 ]);
 const ARBITRATED_CONTROL_TYPES = new Set([
   'PLAY',
@@ -344,6 +346,28 @@ function sanitizeQueue(queue) {
     if (next.length >= MAX_QUEUE_SIZE) break;
   }
   return next;
+}
+
+function hasSameTrackStableKeyMultiset(first, second) {
+  if (first.length !== second.length) return false;
+  const counts = new Map();
+  for (const track of first) {
+    const stableKey = normalizeOptionalString(track?.stableKey);
+    if (!stableKey) return false;
+    counts.set(stableKey, (counts.get(stableKey) || 0) + 1);
+  }
+  for (const track of second) {
+    const stableKey = normalizeOptionalString(track?.stableKey);
+    if (!stableKey) return false;
+    const count = counts.get(stableKey) || 0;
+    if (count <= 0) return false;
+    if (count === 1) {
+      counts.delete(stableKey);
+    } else {
+      counts.set(stableKey, count - 1);
+    }
+  }
+  return counts.size === 0;
 }
 
 function stripTrackAudioLink(track) {
@@ -1077,11 +1101,35 @@ export class ListeningRoomDO extends DurableObject {
     return next;
   }
 
+  validateQueueReorderEvent(event) {
+    if (!Array.isArray(event?.queue)) {
+      return { ok: false, error: 'queue reorder queue required' };
+    }
+    const requesterQueue = sanitizeQueue(event.queue);
+    const roomQueue = sanitizeQueue(this.room.queue);
+    if (!requesterQueue.length || !roomQueue.length) {
+      return { ok: false, error: 'queue reorder queue unavailable' };
+    }
+    if (!hasSameTrackStableKeyMultiset(requesterQueue, roomQueue)) {
+      return { ok: false, error: 'queue reorder content mismatch' };
+    }
+    const requestedIndex = event.currentIndex;
+    if (!Number.isInteger(requestedIndex) || requestedIndex < 0 || requestedIndex >= requesterQueue.length) {
+      return { ok: false, error: 'queue reorder current index invalid' };
+    }
+    const currentStableKey = this.currentTrackStableKey();
+    if (!currentStableKey || requesterQueue[requestedIndex]?.stableKey !== currentStableKey) {
+      return { ok: false, error: 'queue reorder current track mismatch' };
+    }
+    return { ok: true };
+  }
+
   sanitizeForwardedControlPayload(event, effectiveType) {
     const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
     const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
     const requesterQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : [];
-    const shouldReplaceQueue = effectiveType === 'SET_TRACK' && requesterQueue.length > 0;
+    const shouldReplaceQueue =
+      (effectiveType === 'SET_TRACK' || effectiveType === 'SET_QUEUE') && requesterQueue.length > 0;
     const nextShuffleEnabled = typeof event.shuffleEnabled === 'boolean'
       ? event.shuffleEnabled
       : this.room.playback.shuffleEnabled === true;
@@ -1098,10 +1146,12 @@ export class ListeningRoomDO extends DurableObject {
     const requestedIndex = effectiveType === 'SET_TRACK'
       ? nextQueue.findIndex((track) => track?.stableKey === requestedStableKey)
       : -1;
-    const nextIndex = requestedIndex >= 0
-      ? requestedIndex
-      : shuffledQueue?.currentIndex ?? fallbackIndex;
-    const nextTrack = effectiveType === 'SET_TRACK'
+    const nextIndex = effectiveType === 'SET_QUEUE'
+      ? normalizeIndex(event.currentIndex, nextQueue.length, fallbackIndex)
+      : requestedIndex >= 0
+        ? requestedIndex
+        : shuffledQueue?.currentIndex ?? fallbackIndex;
+    const nextTrack = effectiveType === 'SET_TRACK' || effectiveType === 'SET_QUEUE'
       ? nextQueue[nextIndex] || this.currentTrack()
       : this.currentTrack() || nextQueue[nextIndex] || null;
     const nextPositionMs = Math.max(0, Number(event.positionMs ?? this.expectedPosition()));
@@ -2086,6 +2136,13 @@ export class ListeningRoomDO extends DurableObject {
         ok: true,
         applied: this.buildAppliedPayload(type, senderId, eventId, senderNickname),
       };
+    }
+
+    if (effectiveType === 'SET_QUEUE') {
+      const queueReorderCheck = this.validateQueueReorderEvent(event);
+      if (!queueReorderCheck.ok) {
+        return { ok: false, error: queueReorderCheck.error };
+      }
     }
 
     if (type === 'TRACK_FINISHED') {
