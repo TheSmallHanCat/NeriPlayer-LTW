@@ -95,10 +95,11 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 `REQUEST_SEEK` 和 `REQUEST_PLAYBACK_MODE` 必须携带能匹配当前歌曲的
 `requestTrackStableKey`（也可从事件里的 `track` 或 `queue[currentIndex]` 推导），
 避免延迟请求误操作已经切换的歌曲。`REQUEST_SET_TRACK` 只能选择服务端当前队列
-中已有的曲目，成员携带的队列不会写入房态。`REQUEST_SET_QUEUE` 只允许重排
-服务端现有队列，必须保留全部曲目和正在播放的曲目；它不会重置播放状态或进度。
-控制事件如果带有同一客户端实例的 `clientSequence` 或较旧的 `clientTimeMs`，也会
-被 Worker 丢弃。
+中已有的曲目，成员携带的队列不会写入房态。`REQUEST_SET_QUEUE` 每次只允许一种
+受校验的队列变更：保留当前曲目的重排、单曲插入、单曲移除，或移除当前曲目后按
+移除位置选择下一首（末尾则选择前一首）；单曲队列还可被清空。它不会允许一次替换
+多首曲目，并会保留未受影响时的播放状态和进度。控制事件如果带有同一客户端实例的
+`clientSequence` 或较旧的 `clientTimeMs`，也会被 Worker 丢弃。
 
 ### 其他事件
 
