@@ -7,6 +7,7 @@ import {
   publicRoomStateWithCurrentStreamUrl,
 } from './stream-url-cache.js';
 import { shuffleListenTogetherQueue } from './queue-order.js';
+import { validateListenTogetherQueueMutation } from './queue-mutation.js';
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -346,28 +347,6 @@ function sanitizeQueue(queue) {
     if (next.length >= MAX_QUEUE_SIZE) break;
   }
   return next;
-}
-
-function hasSameTrackStableKeyMultiset(first, second) {
-  if (first.length !== second.length) return false;
-  const counts = new Map();
-  for (const track of first) {
-    const stableKey = normalizeOptionalString(track?.stableKey);
-    if (!stableKey) return false;
-    counts.set(stableKey, (counts.get(stableKey) || 0) + 1);
-  }
-  for (const track of second) {
-    const stableKey = normalizeOptionalString(track?.stableKey);
-    if (!stableKey) return false;
-    const count = counts.get(stableKey) || 0;
-    if (count <= 0) return false;
-    if (count === 1) {
-      counts.delete(stableKey);
-    } else {
-      counts.set(stableKey, count - 1);
-    }
-  }
-  return counts.size === 0;
 }
 
 function stripTrackAudioLink(track) {
@@ -932,13 +911,18 @@ export class ListeningRoomDO extends DurableObject {
     };
   }
 
-  eventQueueOrCurrent(eventQueue) {
+  eventQueueOrCurrent(eventQueue, allowEmpty = false) {
     if (!Array.isArray(eventQueue)) return this.room.queue;
     const nextQueue = sanitizeQueue(eventQueue);
-    return nextQueue.length ? nextQueue : this.room.queue;
+    return nextQueue.length || allowEmpty ? nextQueue : this.room.queue;
   }
 
   normalizeCurrentTrack() {
+    if (!this.room.queue.length) {
+      this.room.currentIndex = -1;
+      this.room.track = null;
+      return;
+    }
     this.room.currentIndex = normalizeIndex(
       this.room.currentIndex,
       this.room.queue.length,
@@ -1101,25 +1085,35 @@ export class ListeningRoomDO extends DurableObject {
     return next;
   }
 
-  validateQueueReorderEvent(event) {
+  validateQueueUpdateEvent(event, isController) {
     if (!Array.isArray(event?.queue)) {
-      return { ok: false, error: 'queue reorder queue required' };
+      return { ok: false, error: 'queue update queue required' };
     }
     const requesterQueue = sanitizeQueue(event.queue);
     const roomQueue = sanitizeQueue(this.room.queue);
-    if (!requesterQueue.length || !roomQueue.length) {
-      return { ok: false, error: 'queue reorder queue unavailable' };
+    if (requesterQueue.length !== event.queue.length) {
+      return { ok: false, error: 'queue update contains invalid track' };
     }
-    if (!hasSameTrackStableKeyMultiset(requesterQueue, roomQueue)) {
-      return { ok: false, error: 'queue reorder content mismatch' };
+    if (!isController) {
+      return validateListenTogetherQueueMutation({
+        roomQueue,
+        requesterQueue,
+        roomCurrentIndex: this.room.currentIndex,
+        requesterCurrentIndex: event.currentIndex,
+      });
+    }
+    if (!requesterQueue.length) {
+      return event.currentIndex === -1
+        ? { ok: true, kind: 'clear' }
+        : { ok: false, error: 'queue clear current index invalid' };
     }
     const requestedIndex = event.currentIndex;
     if (!Number.isInteger(requestedIndex) || requestedIndex < 0 || requestedIndex >= requesterQueue.length) {
-      return { ok: false, error: 'queue reorder current index invalid' };
+      return { ok: false, error: 'queue update current index invalid' };
     }
-    const currentStableKey = this.currentTrackStableKey();
-    if (!currentStableKey || requesterQueue[requestedIndex]?.stableKey !== currentStableKey) {
-      return { ok: false, error: 'queue reorder current track mismatch' };
+    const eventTrack = sanitizeTrack(event.track);
+    if (eventTrack && eventTrack.stableKey !== requesterQueue[requestedIndex]?.stableKey) {
+      return { ok: false, error: 'queue update current track mismatch' };
     }
     return { ok: true };
   }
@@ -1128,8 +1122,10 @@ export class ListeningRoomDO extends DurableObject {
     const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
     const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
     const requesterQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : [];
+    const hasRequesterQueue = Array.isArray(event.queue) &&
+      (requesterQueue.length > 0 || (effectiveType === 'SET_QUEUE' && event.queue.length === 0));
     const shouldReplaceQueue =
-      (effectiveType === 'SET_TRACK' || effectiveType === 'SET_QUEUE') && requesterQueue.length > 0;
+      (effectiveType === 'SET_TRACK' || effectiveType === 'SET_QUEUE') && hasRequesterQueue;
     const nextShuffleEnabled = typeof event.shuffleEnabled === 'boolean'
       ? event.shuffleEnabled
       : this.room.playback.shuffleEnabled === true;
@@ -1147,12 +1143,14 @@ export class ListeningRoomDO extends DurableObject {
       ? nextQueue.findIndex((track) => track?.stableKey === requestedStableKey)
       : -1;
     const nextIndex = effectiveType === 'SET_QUEUE'
-      ? normalizeIndex(event.currentIndex, nextQueue.length, fallbackIndex)
+      ? nextQueue.length
+        ? normalizeIndex(event.currentIndex, nextQueue.length, fallbackIndex)
+        : -1
       : requestedIndex >= 0
         ? requestedIndex
         : shuffledQueue?.currentIndex ?? fallbackIndex;
     const nextTrack = effectiveType === 'SET_TRACK' || effectiveType === 'SET_QUEUE'
-      ? nextQueue[nextIndex] || this.currentTrack()
+      ? nextQueue[nextIndex] || null
       : this.currentTrack() || nextQueue[nextIndex] || null;
     const nextPositionMs = Math.max(0, Number(event.positionMs ?? this.expectedPosition()));
     const nextState =
@@ -1547,9 +1545,28 @@ export class ListeningRoomDO extends DurableObject {
         shuffleEnabled: nextShuffleEnabled,
       };
     } else if (effectiveType === 'SET_QUEUE') {
-      this.room.queue = this.eventQueueOrCurrent(event.queue);
-      this.room.currentIndex = normalizeIndex(event.currentIndex, this.room.queue.length, this.room.currentIndex);
-      this.room.track = this.room.queue[this.room.currentIndex] || this.room.track;
+      const previousTrack = this.currentTrack();
+      const nextQueue = this.eventQueueOrCurrent(event.queue, true);
+      const nextIndex = nextQueue.length
+        ? normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex)
+        : -1;
+      const nextTrack = nextQueue[nextIndex] || null;
+      const trackChanged = previousTrack?.stableKey !== nextTrack?.stableKey;
+      this.room.queue = nextQueue;
+      this.room.currentIndex = nextIndex;
+      this.room.track = nextTrack;
+      if (trackChanged || nextTrack == null) {
+        this.room.playback = {
+          ...this.room.playback,
+          state: nextTrack && event.shouldPlay ? 'playing' : 'paused',
+          basePositionMs: nextTrack
+            ? Math.max(0, Number(event.positionMs ?? 0))
+            : 0,
+          baseTimestampMs: committedAt,
+          repeatMode: nextRepeatMode,
+          shuffleEnabled: nextShuffleEnabled,
+        };
+      }
     } else if (effectiveType === 'UPDATE_SETTINGS') {
       this.room.settings = this.normalizeSettings(event.roomSettings);
       if (this.room.settings.shareAudioLinks === false) {
@@ -2139,9 +2156,9 @@ export class ListeningRoomDO extends DurableObject {
     }
 
     if (effectiveType === 'SET_QUEUE') {
-      const queueReorderCheck = this.validateQueueReorderEvent(event);
-      if (!queueReorderCheck.ok) {
-        return { ok: false, error: queueReorderCheck.error };
+      const queueUpdateCheck = this.validateQueueUpdateEvent(event, isController);
+      if (!queueUpdateCheck.ok) {
+        return { ok: false, error: queueUpdateCheck.error };
       }
     }
 

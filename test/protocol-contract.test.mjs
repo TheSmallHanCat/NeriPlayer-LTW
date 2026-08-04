@@ -42,12 +42,12 @@ expectSourceContains(/const TRACK_BOUND_REQUEST_TYPES = new Set\(\[[\s\S]*'REQUE
 expectSourceContains(/const TRACK_QUEUE_BOUND_REQUEST_TYPES = new Set\(\[[\s\S]*'REQUEST_SET_TRACK'/, 'set-track queue binding');
 expectSourceContains(/member control target unavailable/, 'set-track existing queue validation');
 expectSourceContains(/const requesterQueue = Array\.isArray\(event\.queue\) \? sanitizeQueue\(event\.queue\) : \[\];/, 'sanitized requester queue');
-expectSourceContains(/\(effectiveType === 'SET_TRACK' \|\| effectiveType === 'SET_QUEUE'\) && requesterQueue\.length > 0;/, 'listener queue adoption');
+expectSourceContains(/const hasRequesterQueue = Array\.isArray\(event\.queue\) &&\s*\(requesterQueue\.length > 0 \|\| \(effectiveType === 'SET_QUEUE' && event\.queue\.length === 0\)\);/, 'explicit empty queue adoption');
+expectSourceContains(/\(effectiveType === 'SET_TRACK' \|\| effectiveType === 'SET_QUEUE'\) && hasRequesterQueue;/, 'listener queue adoption');
 expectSourceContains(/const nextQueue = shouldReplaceQueue\s*\? requesterQueue\s*:\s*shuffledQueue\?\.queue \|\| fallbackQueue;/, 'set-track queue fallback');
-expectSourceContains(/function hasSameTrackStableKeyMultiset/, 'queue reorder membership comparison');
-expectSourceContains(/validateQueueReorderEvent\(event\)/, 'queue reorder validation');
-expectSourceContains(/queue reorder content mismatch/, 'queue reorder content rejection');
-expectSourceContains(/queue reorder current track mismatch/, 'queue reorder current-track rejection');
+expectSourceContains(/validateListenTogetherQueueMutation/, 'queue mutation validation');
+expectSourceContains(/validateQueueUpdateEvent\(event, isController\)/, 'queue update validation');
+expectSourceContains(/queue update contains invalid track/, 'queue update invalid-track rejection');
 expectSourceContains(/shuffleListenTogetherQueue\(fallbackQueue, fallbackIndex\)/, 'listener playback mode shared queue shuffle');
 expectSourceContains(/isController \|\| type === 'REQUEST_PLAYBACK_MODE'/, 'playback mode queue commitment');
 expectSourceContains(/requesterQueue\.some\(\(track\) => track\?\.stableKey === requestedStableKey\)/, 'requester queue target validation');
