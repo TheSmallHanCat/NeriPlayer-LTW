@@ -38,7 +38,9 @@ expectSourceContains(/const TRACK_QUEUE_BOUND_REQUEST_TYPES = new Set\(\[[\s\S]*
 expectSourceContains(/member control target unavailable/, 'set-track existing queue validation');
 expectSourceContains(/const requesterQueue = Array\.isArray\(event\.queue\) \? sanitizeQueue\(event\.queue\) : \[\];/, 'sanitized requester queue');
 expectSourceContains(/const shouldReplaceQueue = effectiveType === 'SET_TRACK' && requesterQueue\.length > 0;/, 'listener set-track queue adoption');
-expectSourceContains(/const nextQueue = shouldReplaceQueue \? requesterQueue : fallbackQueue;/, 'set-track queue fallback');
+expectSourceContains(/const nextQueue = shouldReplaceQueue\s*\? requesterQueue\s*:\s*shuffledQueue\?\.queue \|\| fallbackQueue;/, 'set-track queue fallback');
+expectSourceContains(/shuffleListenTogetherQueue\(fallbackQueue, fallbackIndex\)/, 'listener playback mode shared queue shuffle');
+expectSourceContains(/isController \|\| type === 'REQUEST_PLAYBACK_MODE'/, 'playback mode queue commitment');
 expectSourceContains(/requesterQueue\.some\(\(track\) => track\?\.stableKey === requestedStableKey\)/, 'requester queue target validation');
 expectSourceContains(/clientInstanceId/, 'client instance ordering scope');
 expectSourceContains(/clientSequence/, 'clientSequence ordering support');
