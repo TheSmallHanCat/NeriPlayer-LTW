@@ -6,6 +6,7 @@ import {
   normalizeStreamUrlCache,
   publicRoomStateWithCurrentStreamUrl,
 } from './stream-url-cache.js';
+import { shuffleListenTogetherQueue } from './queue-order.js';
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -1081,12 +1082,25 @@ export class ListeningRoomDO extends DurableObject {
     const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
     const requesterQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : [];
     const shouldReplaceQueue = effectiveType === 'SET_TRACK' && requesterQueue.length > 0;
+    const nextShuffleEnabled = typeof event.shuffleEnabled === 'boolean'
+      ? event.shuffleEnabled
+      : this.room.playback.shuffleEnabled === true;
+    const shouldShuffleRoomQueue = effectiveType === 'PLAYBACK_MODE' &&
+      nextShuffleEnabled &&
+      this.room.playback.shuffleEnabled !== true;
+    const shuffledQueue = shouldShuffleRoomQueue
+      ? shuffleListenTogetherQueue(fallbackQueue, fallbackIndex)
+      : null;
     const requestedStableKey = requestedStableKeyFromRequesterEvent(event);
-    const nextQueue = shouldReplaceQueue ? requesterQueue : fallbackQueue;
+    const nextQueue = shouldReplaceQueue
+      ? requesterQueue
+      : shuffledQueue?.queue || fallbackQueue;
     const requestedIndex = effectiveType === 'SET_TRACK'
       ? nextQueue.findIndex((track) => track?.stableKey === requestedStableKey)
       : -1;
-    const nextIndex = requestedIndex >= 0 ? requestedIndex : fallbackIndex;
+    const nextIndex = requestedIndex >= 0
+      ? requestedIndex
+      : shuffledQueue?.currentIndex ?? fallbackIndex;
     const nextTrack = effectiveType === 'SET_TRACK'
       ? nextQueue[nextIndex] || this.currentTrack()
       : this.currentTrack() || nextQueue[nextIndex] || null;
@@ -1111,9 +1125,7 @@ export class ListeningRoomDO extends DurableObject {
       clientTimeMs: Number(event.clientTimeMs) || nowMs(),
       requestTrackStableKey: requestedStableKey || nextTrack?.stableKey || null,
       repeatMode: normalizeRepeatMode(event.repeatMode, this.room.playback.repeatMode ?? 0),
-      shuffleEnabled: typeof event.shuffleEnabled === 'boolean'
-        ? event.shuffleEnabled
-        : this.room.playback.shuffleEnabled === true,
+      shuffleEnabled: nextShuffleEnabled,
     };
   }
 
@@ -1423,11 +1435,23 @@ export class ListeningRoomDO extends DurableObject {
       this.room.currentIndex = nextIndex;
       this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
     } else if (effectiveType === 'PLAYBACK_MODE') {
+      const incomingQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : [];
+      const shouldApplyIncomingQueue = incomingQueue.length > 0 &&
+        (isController || type === 'REQUEST_PLAYBACK_MODE');
+      const nextQueue = shouldApplyIncomingQueue ? incomingQueue : this.room.queue;
+      const nextIndex = normalizeIndex(
+        event.currentIndex,
+        nextQueue.length,
+        this.room.currentIndex,
+      );
       this.room.playback = {
         ...this.room.playback,
         repeatMode: nextRepeatMode,
         shuffleEnabled: nextShuffleEnabled,
       };
+      this.room.queue = nextQueue;
+      this.room.currentIndex = nextIndex;
+      this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
     } else if (effectiveType === 'LINK_READY') {
       if (!isController) {
         return { ok: false, error: 'only controller can publish link' };
