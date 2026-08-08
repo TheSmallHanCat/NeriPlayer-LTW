@@ -14,12 +14,12 @@
   `memberSecret`，这些密钥不会写入脱敏房间状态
 - WebSocket 实时同步播放状态、队列、切歌、循环模式、随机播放和房间设置
 - 听众可发起控制请求，由 Worker 校验房间策略、房主在线状态和目标歌曲后直接提交
-- 可选共享房主解析出的多个播放直链，减少听众端重复取流压力；Worker 会持久缓存
+- 可选共享房主解析出的多个播放候选，减少听众端重复解析压力；Worker 会持久缓存
   房主当前曲目最多三条去重后的 HTTP(S) 候选，缓存命中时听众无需等待房主在线，
-  且只会公开当前曲目的链接。听众始终先按本机音质策略解析，候选只作为本次会话的
+  且只会公开当前曲目的候选。听众始终先按本机音质策略解析，候选只作为本次会话的
   失败回退，不写入歌曲或离线缓存
 - 本地歌曲不能创建房间或进入同步事件；关闭 `shareAudioLinks` 后会立刻清空
-  房间里已缓存的直链
+  房间里已缓存的候选
 - 房间状态持久化、控制者离线检测与自动关房
 - 新成员加入时可按房间设置自动暂停；同一成员使用 `memberSecret` 或 Token 重连不会触发暂停
 - 成员通过“离开房间”接口显式退出时，Worker 会删除成员并广播 `MEMBER_LEFT`；普通 WebSocket 断线仍保留成员以支持重连
@@ -34,7 +34,7 @@
 - 本地调试一起听协议、房间状态和 WebSocket 消息
 
 它不是媒体代理或公共曲库服务。音频播放能力仍来自 NeriPlayer 客户端本身，
-Worker 只负责房间状态、权限、队列、同步事件和当前曲目的会话候选直链。
+Worker 只负责房间状态、权限、队列、同步事件和当前曲目的会话候选。
 
 ## 仓库结构
 
@@ -112,7 +112,7 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 房间快照和广播消息中的 `expectedPositionMs` 由服务端根据当前播放状态推算：
 播放中时按 `basePositionMs + elapsed * playbackRate` 前进，暂停时保持基础位置。
 当 `repeatMode=1` 且当前曲目时长有效时，位置会按曲目时长取模；其他模式保持
-非负的推算值。客户端应使用该字段配合 `nowMs` 校正本地进度，不要把候选直链
+非负的推算值。客户端应使用该字段配合 `nowMs` 校正本地进度，不要把候选播放地址
 缓存当成普通歌曲缓存。
 
 ## 房间与身份约束
@@ -132,13 +132,13 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 - 当 `shareAudioLinks=false` 时，HTTP `state` 快照，以及 WebSocket
   `welcome` / `room_state_updated` 消息里的 `state`，都会把
   `track.streamUrl`、`track.streamUrls` 与队列对应字段清空
-- `UPDATE_SETTINGS` 关闭 `shareAudioLinks` 后，会立即清空房间里已缓存的直链
-- 重新开启 `shareAudioLinks` 后，房主客户端会立即重新上传当前歌曲的候选直链；房态只会
-  公开当前曲目的缓存链接，历史缓存不会泄漏到队列中的其他歌曲
+- `UPDATE_SETTINGS` 关闭 `shareAudioLinks` 后，会立即清空房间里已缓存的候选
+- 重新开启 `shareAudioLinks` 后，房主客户端会立即重新上传当前歌曲的候选播放地址；房态只会
+  公开当前曲目的缓存候选，历史缓存不会泄漏到队列中的其他歌曲
 - `REQUEST_LINK` 在 `shareAudioLinks=false` 时会直接失败，返回
   `audio link sharing disabled`
 - 命中当前曲目缓存的 `REQUEST_LINK` 会直接广播权威房态；`forceRefresh=true` 会绕过
-  缓存并向在线房主请求刷新，用于直链失效后的恢复
+  缓存并向在线房主请求刷新，用于候选失效后的恢复
 - 房态里的 `expectedPositionMs` 是服务端推算的位置，播放中会随
   `playbackRate` 前进；单曲循环按当前曲目 `durationMs` 回绕
 - Token 有效期为 **24 小时**，由 `LISTEN_TOGETHER_TOKEN_SECRET` 参与 HMAC 签名
@@ -154,7 +154,7 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 - HTTP/WS Token 只用于房间控制鉴权，不代表第三方音乐平台授权
 - `GET /api/rooms/:roomId/state` 需要房间成员的 Bearer Token；健康检查 `/healthz`
   仍保持公开
-- `shareAudioLinks` 开启时会同步房主解析出的播放直链，请只在可信房间使用；
+- `shareAudioLinks` 开启时会同步房主解析出的播放候选，请只在可信房间使用；
   这些最多三条候选只用于当前会话回退，不是 NeriPlayer 的歌曲或离线缓存
 - 自建实例的日志、访问控制和域名策略由部署者自己负责
 
