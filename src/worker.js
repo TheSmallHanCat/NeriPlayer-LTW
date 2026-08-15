@@ -6,8 +6,16 @@ import {
   normalizeStreamUrlCache,
   publicRoomStateWithCurrentStreamUrl,
 } from './stream-url-cache.js';
-import { shuffleListenTogetherQueue } from './queue-order.js';
-import { validateListenTogetherQueueMutation } from './queue-mutation.js';
+import { resolveListenTogetherPlaybackModeQueue } from './queue-order.js';
+import {
+  hasSameTrackStableKeySequence,
+  validateListenTogetherPlaybackModeQueue,
+  validateListenTogetherQueueMutation,
+} from './queue-mutation.js';
+import {
+  expectedPlaybackPosition,
+  playbackModeAnchor,
+} from './playback-position.js';
 
 function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -248,21 +256,6 @@ function normalizeRepeatMode(value, fallback = 0) {
   const mode = Number(value);
   if (mode === 0 || mode === 1 || mode === 2) return mode;
   return fallback;
-}
-
-const REPEAT_MODE_ONE = 1;
-
-function wrapSingleTrackRepeatPosition(positionMs, playback, track) {
-  const normalizedPositionMs = Math.max(0, Math.floor(Number(positionMs) || 0));
-  const durationMs = Number(track?.durationMs);
-  if (
-    playback?.repeatMode !== REPEAT_MODE_ONE ||
-    !Number.isFinite(durationMs) ||
-    durationMs <= 0
-  ) {
-    return normalizedPositionMs;
-  }
-  return normalizedPositionMs % Math.floor(durationMs);
 }
 
 function normalizeIndex(index, queueLength, fallback = 0) {
@@ -726,14 +719,10 @@ export class ListeningRoomDO extends DurableObject {
   }
 
   expectedPosition(atMs = nowMs()) {
-    const p = this.room.playback;
-    if (p.state !== 'playing') return p.basePositionMs;
-    const projectedPositionMs = p.basePositionMs +
-      (atMs - p.baseTimestampMs) * (p.playbackRate || 1);
-    return wrapSingleTrackRepeatPosition(
-      projectedPositionMs,
-      p,
-      this.currentTrack()
+    return expectedPlaybackPosition(
+      this.room.playback,
+      this.currentTrack(),
+      atMs,
     );
   }
 
@@ -1118,6 +1107,38 @@ export class ListeningRoomDO extends DurableObject {
     return { ok: true };
   }
 
+  validatePlaybackModeQueueEvent(event) {
+    if (!Array.isArray(event?.queue)) {
+      return { ok: true, kind: 'legacy' };
+    }
+    const requesterQueue = sanitizeQueue(event.queue);
+    const roomQueue = sanitizeQueue(this.room.queue);
+    if (requesterQueue.length !== event.queue.length) {
+      return { ok: false, error: 'playback mode queue contains invalid track' };
+    }
+    const validation = validateListenTogetherPlaybackModeQueue({
+      roomQueue,
+      requesterQueue,
+      roomCurrentIndex: this.room.currentIndex,
+      requesterCurrentIndex: event.currentIndex,
+    });
+    if (!validation.ok) return validation;
+    const eventTrack = sanitizeTrack(event.track);
+    if (eventTrack && eventTrack.stableKey !== requesterQueue[event.currentIndex]?.stableKey) {
+      return { ok: false, error: 'playback mode track mismatch' };
+    }
+    return validation;
+  }
+
+  shouldAdoptPlaybackModeQueue(requesterQueue, nextShuffleEnabled) {
+    if (!requesterQueue.length) return false;
+    const enablingShuffle = nextShuffleEnabled && this.room.playback.shuffleEnabled !== true;
+    return !(
+      enablingShuffle &&
+      hasSameTrackStableKeySequence(requesterQueue, sanitizeQueue(this.room.queue))
+    );
+  }
+
   sanitizeForwardedControlPayload(event, effectiveType) {
     const fallbackQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
     const fallbackIndex = normalizeIndex(this.room.currentIndex, fallbackQueue.length, 0);
@@ -1129,16 +1150,27 @@ export class ListeningRoomDO extends DurableObject {
     const nextShuffleEnabled = typeof event.shuffleEnabled === 'boolean'
       ? event.shuffleEnabled
       : this.room.playback.shuffleEnabled === true;
-    const shouldShuffleRoomQueue = effectiveType === 'PLAYBACK_MODE' &&
-      nextShuffleEnabled &&
-      this.room.playback.shuffleEnabled !== true;
-    const shuffledQueue = shouldShuffleRoomQueue
-      ? shuffleListenTogetherQueue(fallbackQueue, fallbackIndex)
+    const playbackModeQueueValidation = effectiveType === 'PLAYBACK_MODE'
+      ? this.validatePlaybackModeQueueEvent(event)
+      : null;
+    const playbackModeQueue = effectiveType === 'PLAYBACK_MODE'
+      ? resolveListenTogetherPlaybackModeQueue({
+          roomQueue: fallbackQueue,
+          roomCurrentIndex: fallbackIndex,
+          requesterQueue,
+          requesterCurrentIndex: event.currentIndex,
+          adoptRequesterQueue:
+            Array.isArray(event.queue) &&
+              playbackModeQueueValidation?.ok === true &&
+              this.shouldAdoptPlaybackModeQueue(requesterQueue, nextShuffleEnabled),
+          shuffleEnabled: nextShuffleEnabled,
+          previousShuffleEnabled: this.room.playback.shuffleEnabled === true,
+        })
       : null;
     const requestedStableKey = requestedStableKeyFromRequesterEvent(event);
     const nextQueue = shouldReplaceQueue
       ? requesterQueue
-      : shuffledQueue?.queue || fallbackQueue;
+      : playbackModeQueue?.queue || fallbackQueue;
     const requestedIndex = effectiveType === 'SET_TRACK'
       ? nextQueue.findIndex((track) => track?.stableKey === requestedStableKey)
       : -1;
@@ -1146,9 +1178,11 @@ export class ListeningRoomDO extends DurableObject {
       ? nextQueue.length
         ? normalizeIndex(event.currentIndex, nextQueue.length, fallbackIndex)
         : -1
+      : effectiveType === 'PLAYBACK_MODE'
+        ? playbackModeQueue?.currentIndex ?? fallbackIndex
       : requestedIndex >= 0
         ? requestedIndex
-        : shuffledQueue?.currentIndex ?? fallbackIndex;
+        : fallbackIndex;
     const nextTrack = effectiveType === 'SET_TRACK' || effectiveType === 'SET_QUEUE'
       ? nextQueue[nextIndex] || null
       : this.currentTrack() || nextQueue[nextIndex] || null;
@@ -1426,6 +1460,9 @@ export class ListeningRoomDO extends DurableObject {
     const nextShuffleEnabled = typeof event.shuffleEnabled === 'boolean'
       ? event.shuffleEnabled
       : this.room.playback.shuffleEnabled === true;
+    const nextPlaybackModeAnchor = effectiveType === 'PLAYBACK_MODE'
+      ? playbackModeAnchor(this.room.playback, this.currentTrack(), committedAt)
+      : null;
     if (effectiveType === 'PLAY') {
       const nextQueue = this.eventQueueOrCurrent(event.queue);
       const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
@@ -1485,15 +1522,23 @@ export class ListeningRoomDO extends DurableObject {
     } else if (effectiveType === 'PLAYBACK_MODE') {
       const incomingQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : [];
       const shouldApplyIncomingQueue = incomingQueue.length > 0 &&
-        (isController || type === 'REQUEST_PLAYBACK_MODE');
-      const nextQueue = shouldApplyIncomingQueue ? incomingQueue : this.room.queue;
-      const nextIndex = normalizeIndex(
-        event.currentIndex,
-        nextQueue.length,
-        this.room.currentIndex,
-      );
+        (isController || type === 'REQUEST_PLAYBACK_MODE') &&
+        this.shouldAdoptPlaybackModeQueue(incomingQueue, nextShuffleEnabled);
+      const playbackModeQueue = resolveListenTogetherPlaybackModeQueue({
+        roomQueue: this.room.queue,
+        roomCurrentIndex: this.room.currentIndex,
+        requesterQueue: incomingQueue,
+        requesterCurrentIndex: event.currentIndex,
+        adoptRequesterQueue: shouldApplyIncomingQueue,
+        shuffleEnabled: nextShuffleEnabled,
+        previousShuffleEnabled: this.room.playback.shuffleEnabled === true,
+      });
+      const nextQueue = playbackModeQueue.queue;
+      const nextIndex = playbackModeQueue.currentIndex;
       this.room.playback = {
         ...this.room.playback,
+        basePositionMs: nextPlaybackModeAnchor.basePositionMs,
+        baseTimestampMs: nextPlaybackModeAnchor.baseTimestampMs,
         repeatMode: nextRepeatMode,
         shuffleEnabled: nextShuffleEnabled,
       };
@@ -2159,6 +2204,13 @@ export class ListeningRoomDO extends DurableObject {
       const queueUpdateCheck = this.validateQueueUpdateEvent(event, isController);
       if (!queueUpdateCheck.ok) {
         return { ok: false, error: queueUpdateCheck.error };
+      }
+    }
+
+    if (effectiveType === 'PLAYBACK_MODE') {
+      const playbackModeQueueCheck = this.validatePlaybackModeQueueEvent(event);
+      if (!playbackModeQueueCheck.ok) {
+        return { ok: false, error: playbackModeQueueCheck.error };
       }
     }
 

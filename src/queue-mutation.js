@@ -26,6 +26,37 @@ export function hasSameTrackStableKeyMultiset(first, second) {
   return counts.size === 0;
 }
 
+export function hasSameTrackStableKeySequence(first, second) {
+  if (!Array.isArray(first) || !Array.isArray(second) || first.length !== second.length) {
+    return false;
+  }
+  return first.every((track, index) => {
+    const firstKey = stableKey(track);
+    return firstKey != null && firstKey === stableKey(second[index]);
+  });
+}
+
+export function validateListenTogetherPlaybackModeQueue({
+  roomQueue,
+  requesterQueue,
+  roomCurrentIndex,
+  requesterCurrentIndex,
+}) {
+  if (!Array.isArray(roomQueue) || !Array.isArray(requesterQueue) || !roomQueue.length) {
+    return { ok: false, error: 'playback mode queue unavailable' };
+  }
+  if (!hasSameTrackStableKeyMultiset(requesterQueue, roomQueue)) {
+    return { ok: false, error: 'playback mode queue content mismatch' };
+  }
+  const currentKey = stableKey(roomQueue[roomCurrentIndex]);
+  if (!currentKey) {
+    return { ok: false, error: 'playback mode current track unavailable' };
+  }
+  return hasCurrentTrackAt(requesterQueue, requesterCurrentIndex, currentKey)
+    ? { ok: true, kind: 'reorder' }
+    : { ok: false, error: 'playback mode current track mismatch' };
+}
+
 function resolveRemovedIndex(source, target) {
   if (source.length !== target.length + 1) return null;
   let sourceIndex = 0;
