@@ -109,6 +109,7 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 
 - `REQUEST_LINK`
 - `LINK_READY`
+- `LINK_UNAVAILABLE`
 - `UPDATE_SETTINGS`
 
 ### 服务端位置字段
@@ -143,6 +144,8 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
   `audio link sharing disabled`
 - 命中当前曲目缓存的 `REQUEST_LINK` 会直接广播权威房态；`forceRefresh=true` 会绕过
   缓存并向在线房主请求刷新，用于候选失效后的恢复
+- 房主确认当前曲目只能得到试听片段时会发送 `LINK_UNAVAILABLE`，Worker 只清除该当前
+  曲目的候选缓存并广播最新房态，避免旧试听地址继续下发给听众
 - 房态里的 `expectedPositionMs` 是服务端推算的位置，播放中会随
   `playbackRate` 前进；单曲循环按当前曲目 `durationMs` 回绕。提交循环或随机模式前
   会先按旧播放语义重新锚定位置，避免新一轮已经开始时仍停留在上一轮曲末
