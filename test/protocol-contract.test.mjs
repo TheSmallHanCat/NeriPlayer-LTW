@@ -4,6 +4,10 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const workerSource = readFileSync(resolve(here, '../src/worker.js'), 'utf8');
+const playbackPositionSource = readFileSync(
+  resolve(here, '../src/playback-position.js'),
+  'utf8',
+);
 
 function readStringSet(name) {
   const match = workerSource.match(new RegExp(`const ${name} = new Set\\(\\[([\\s\\S]*?)\\]\\);`));
@@ -28,6 +32,12 @@ function expectSourceContains(pattern, description) {
   }
 }
 
+function expectPlaybackPositionSourceContains(pattern, description) {
+  if (!pattern.test(playbackPositionSource)) {
+    throw new Error(`playback position helper must keep ${description}`);
+  }
+}
+
 expectSetContains('ALLOWED_EVENT_TYPES', 'PLAYBACK_MODE');
 expectSetContains('CONTROLLABLE_EVENT_TYPES', 'PLAYBACK_MODE');
 expectSetContains('ARBITRATED_CONTROL_TYPES', 'PLAYBACK_MODE');
@@ -44,19 +54,23 @@ expectSourceContains(/member control target unavailable/, 'set-track existing qu
 expectSourceContains(/const requesterQueue = Array\.isArray\(event\.queue\) \? sanitizeQueue\(event\.queue\) : \[\];/, 'sanitized requester queue');
 expectSourceContains(/const hasRequesterQueue = Array\.isArray\(event\.queue\) &&\s*\(requesterQueue\.length > 0 \|\| \(effectiveType === 'SET_QUEUE' && event\.queue\.length === 0\)\);/, 'explicit empty queue adoption');
 expectSourceContains(/\(effectiveType === 'SET_TRACK' \|\| effectiveType === 'SET_QUEUE'\) && hasRequesterQueue;/, 'listener queue adoption');
-expectSourceContains(/const nextQueue = shouldReplaceQueue\s*\? requesterQueue\s*:\s*shuffledQueue\?\.queue \|\| fallbackQueue;/, 'set-track queue fallback');
+expectSourceContains(/const nextQueue = shouldReplaceQueue\s*\? requesterQueue\s*:\s*playbackModeQueue\?\.queue \|\| fallbackQueue;/, 'set-track queue fallback');
 expectSourceContains(/validateListenTogetherQueueMutation/, 'queue mutation validation');
 expectSourceContains(/validateQueueUpdateEvent\(event, isController\)/, 'queue update validation');
 expectSourceContains(/queue update contains invalid track/, 'queue update invalid-track rejection');
-expectSourceContains(/shuffleListenTogetherQueue\(fallbackQueue, fallbackIndex\)/, 'listener playback mode shared queue shuffle');
+expectSourceContains(/resolveListenTogetherPlaybackModeQueue\(\{/, 'listener playback mode queue resolution');
+expectSourceContains(/validatePlaybackModeQueueEvent\(event\)/, 'playback mode queue validation');
+expectSourceContains(/shouldAdoptPlaybackModeQueue\(requesterQueue, nextShuffleEnabled\)/, 'legacy unchanged shuffle queue fallback');
 expectSourceContains(/isController \|\| type === 'REQUEST_PLAYBACK_MODE'/, 'playback mode queue commitment');
+expectSourceContains(/playbackModeAnchor\(this\.room\.playback, this\.currentTrack\(\), committedAt\)/, 'playback mode position reanchoring');
 expectSourceContains(/requesterQueue\.some\(\(track\) => track\?\.stableKey === requestedStableKey\)/, 'requester queue target validation');
 expectSourceContains(/clientInstanceId/, 'client instance ordering scope');
 expectSourceContains(/clientSequence/, 'clientSequence ordering support');
 expectSourceContains(/lastControlClientSequences/, 'per-client sequence tracking');
 expectSourceContains(/shouldDropOutdatedControlEvent/, 'outdated control event gate');
-expectSourceContains(/wrapSingleTrackRepeatPosition/, 'single-track repeat position wrapping');
-expectSourceContains(/playback\?\.repeatMode !== REPEAT_MODE_ONE/, 'single-track repeat mode guard');
+expectPlaybackPositionSourceContains(/wrapSingleTrackRepeatPosition/, 'single-track repeat position wrapping');
+expectPlaybackPositionSourceContains(/playback\?\.repeatMode !== REPEAT_MODE_ONE/, 'single-track repeat mode guard');
+expectPlaybackPositionSourceContains(/playbackModeAnchor/, 'playback mode anchor helper');
 expectSourceContains(/shouldSkipMemberChangeAutoPause/, 'member-change auto-pause guard');
 expectSourceContains(/memberChangeVersion/, 'member-change version barrier');
 expectSourceContains(/msg\.type === 'np_ping'/, 'custom clock-sync ping handling');

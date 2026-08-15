@@ -94,7 +94,11 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 不会再等待控制者客户端弹出确认。`REQUEST_PLAY`、`REQUEST_PAUSE`、
 `REQUEST_SEEK` 和 `REQUEST_PLAYBACK_MODE` 必须携带能匹配当前歌曲的
 `requestTrackStableKey`（也可从事件里的 `track` 或 `queue[currentIndex]` 推导），
-避免延迟请求误操作已经切换的歌曲。`REQUEST_SET_TRACK` 只能选择服务端当前队列
+避免延迟请求误操作已经切换的歌曲。`REQUEST_PLAYBACK_MODE` 携带队列时，只接受
+歌曲多重集合不变且 `currentIndex` 仍指向当前歌曲的顺序，并原样提交请求端的随机或
+恢复顺序；增删歌曲或切换当前歌曲会被拒绝。旧客户端没有携带队列时，开启随机仍使用
+服务端兼容乱序，关闭随机则保留当前顺序；携带未重排旧队列的客户端也会走同一兼容乱序。
+`REQUEST_SET_TRACK` 只能选择服务端当前队列
 中已有的曲目，成员携带的队列不会写入房态。`REQUEST_SET_QUEUE` 每次只允许一种
 受校验的队列变更：保留当前曲目的重排、单曲插入、单曲移除，或移除当前曲目后按
 移除位置选择下一首（末尾则选择前一首）；单曲队列还可被清空。它不会允许一次替换
@@ -140,7 +144,8 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 - 命中当前曲目缓存的 `REQUEST_LINK` 会直接广播权威房态；`forceRefresh=true` 会绕过
   缓存并向在线房主请求刷新，用于候选失效后的恢复
 - 房态里的 `expectedPositionMs` 是服务端推算的位置，播放中会随
-  `playbackRate` 前进；单曲循环按当前曲目 `durationMs` 回绕
+  `playbackRate` 前进；单曲循环按当前曲目 `durationMs` 回绕。提交循环或随机模式前
+  会先按旧播放语义重新锚定位置，避免新一轮已经开始时仍停留在上一轮曲末
 - Token 有效期为 **24 小时**，由 `LISTEN_TOGETHER_TOKEN_SECRET` 参与 HMAC 签名
 - `/state` 与 `/control` 都需要有效的 `Authorization: Bearer <token>`；WebSocket
   连接使用返回的 `wsUrl` 中的 token
