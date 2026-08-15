@@ -7,8 +7,12 @@ import {
   publicRoomStateWithCurrentStreamUrl,
   removeCachedStreamUrls,
 } from './stream-url-cache.js';
-import { resolveListenTogetherPlaybackModeQueue } from './queue-order.js';
 import {
+  reconcileListenTogetherShuffleRestoreQueue,
+  resolveListenTogetherPlaybackModeQueue,
+} from './queue-order.js';
+import {
+  hasSameTrackStableKeyMultiset,
   hasSameTrackStableKeySequence,
   validateListenTogetherPlaybackModeQueue,
   validateListenTogetherQueueMutation,
@@ -331,7 +335,9 @@ function isLocalTrackInput(track) {
 
 function eventContainsLocalTrack(event) {
   if (isLocalTrackInput(event?.track)) return true;
-  return Array.isArray(event?.queue) && event.queue.some(isLocalTrackInput);
+  return (Array.isArray(event?.queue) && event.queue.some(isLocalTrackInput)) ||
+    (Array.isArray(event?.shuffleRestoreQueue) &&
+      event.shuffleRestoreQueue.some(isLocalTrackInput));
 }
 
 function sanitizeQueue(queue) {
@@ -521,6 +527,7 @@ export class ListeningRoomDO extends DurableObject {
       queue: [],
       currentIndex: 0,
       track: null,
+      shuffleRestoreQueue: null,
       streamUrlCache: {},
       playback: {
         state: 'paused',
@@ -552,6 +559,15 @@ export class ListeningRoomDO extends DurableObject {
       const joinSecret = normalizeOptionalString(saved?.joinSecret) || randomRoomJoinSecret();
       const settings = this.normalizeSettings(saved?.settings);
       const queue = sanitizeQueue(saved?.queue);
+      const storedQueue = queue.map(stripTrackAudioLink);
+      const storedShuffleRestoreQueue = sanitizeQueue(saved?.shuffleRestoreQueue)
+        .map(stripTrackAudioLink);
+      const shuffleRestoreQueue = saved?.playback?.shuffleEnabled === true
+        ? reconcileListenTogetherShuffleRestoreQueue({
+            roomQueue: storedQueue,
+            shuffleRestoreQueue: storedShuffleRestoreQueue,
+          })
+        : null;
       const currentIndex = normalizeIndex(saved?.currentIndex, queue.length, 0);
       const selectedQueueTrack = queue[currentIndex] || null;
       const savedTrack = sanitizeTrack(saved?.track);
@@ -586,9 +602,10 @@ export class ListeningRoomDO extends DurableObject {
         controllerUserUuid,
         controllerUserId: controllerUserUuid,
         members,
-        queue: queue.map(stripTrackAudioLink),
+        queue: storedQueue,
         currentIndex,
         track: stripTrackAudioLink(track),
+        shuffleRestoreQueue: shuffleRestoreQueue?.length ? shuffleRestoreQueue : null,
         streamUrlCache,
         processedEventIds: Array.isArray(saved.processedEventIds) ? saved.processedEventIds : [],
         lastControlCommittedAt: Number(saved?.lastControlCommittedAt) || 0,
@@ -719,6 +736,17 @@ export class ListeningRoomDO extends DurableObject {
     this.normalizeCurrentTrack();
     this.room.queue = this.room.queue.map(stripTrackAudioLink);
     this.room.track = stripTrackAudioLink(this.room.track);
+  }
+
+  reconcileShuffleRestoreQueue() {
+    if (this.room.playback.shuffleEnabled !== true) {
+      this.room.shuffleRestoreQueue = null;
+      return;
+    }
+    this.room.shuffleRestoreQueue = reconcileListenTogetherShuffleRestoreQueue({
+      roomQueue: this.room.queue,
+      shuffleRestoreQueue: this.room.shuffleRestoreQueue,
+    });
   }
 
   expectedPosition(atMs = nowMs()) {
@@ -891,6 +919,13 @@ export class ListeningRoomDO extends DurableObject {
     const queue = sanitizeQueue(snapshot?.queue);
     const currentIndex = normalizeIndex(snapshot?.currentIndex, queue.length, 0);
     const track = queue[currentIndex] || null;
+    const requestedShuffleRestoreQueue = snapshot?.shuffleEnabled === true
+      ? sanitizeQueue(snapshot?.shuffleRestoreQueue)
+      : [];
+    const shuffleRestoreQueue = requestedShuffleRestoreQueue.length > 0 &&
+      hasSameTrackStableKeyMultiset(queue, requestedShuffleRestoreQueue)
+      ? requestedShuffleRestoreQueue
+      : null;
     return {
       settings: this.normalizeSettings(snapshot?.settings),
       queue,
@@ -900,6 +935,7 @@ export class ListeningRoomDO extends DurableObject {
       positionMs: Number.isFinite(Number(snapshot?.positionMs)) ? Math.max(0, Math.floor(Number(snapshot.positionMs))) : 0,
       repeatMode: normalizeRepeatMode(snapshot?.repeatMode, 0),
       shuffleEnabled: snapshot?.shuffleEnabled === true,
+      shuffleRestoreQueue,
     };
   }
 
@@ -1135,7 +1171,9 @@ export class ListeningRoomDO extends DurableObject {
 
   shouldAdoptPlaybackModeQueue(requesterQueue, nextShuffleEnabled) {
     if (!requesterQueue.length) return false;
-    const enablingShuffle = nextShuffleEnabled && this.room.playback.shuffleEnabled !== true;
+    const previousShuffleEnabled = this.room.playback.shuffleEnabled === true;
+    if (nextShuffleEnabled === previousShuffleEnabled) return false;
+    const enablingShuffle = nextShuffleEnabled && !previousShuffleEnabled;
     return !(
       enablingShuffle &&
       hasSameTrackStableKeySequence(requesterQueue, sanitizeQueue(this.room.queue))
@@ -1168,6 +1206,7 @@ export class ListeningRoomDO extends DurableObject {
               this.shouldAdoptPlaybackModeQueue(requesterQueue, nextShuffleEnabled),
           shuffleEnabled: nextShuffleEnabled,
           previousShuffleEnabled: this.room.playback.shuffleEnabled === true,
+          shuffleRestoreQueue: this.room.shuffleRestoreQueue,
         })
       : null;
     const requestedStableKey = requestedStableKeyFromRequesterEvent(event);
@@ -1528,6 +1567,7 @@ export class ListeningRoomDO extends DurableObject {
       this.room.currentIndex = nextIndex;
       this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
     } else if (effectiveType === 'PLAYBACK_MODE') {
+      const previousShuffleEnabled = this.room.playback.shuffleEnabled === true;
       const incomingQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : [];
       const shouldApplyIncomingQueue = incomingQueue.length > 0 &&
         (isController || type === 'REQUEST_PLAYBACK_MODE') &&
@@ -1539,10 +1579,15 @@ export class ListeningRoomDO extends DurableObject {
         requesterCurrentIndex: event.currentIndex,
         adoptRequesterQueue: shouldApplyIncomingQueue,
         shuffleEnabled: nextShuffleEnabled,
-        previousShuffleEnabled: this.room.playback.shuffleEnabled === true,
+        previousShuffleEnabled,
+        shuffleRestoreQueue: this.room.shuffleRestoreQueue,
       });
       const nextQueue = playbackModeQueue.queue;
       const nextIndex = playbackModeQueue.currentIndex;
+      if (nextShuffleEnabled && !previousShuffleEnabled) {
+        const restoreQueue = sanitizeQueue(this.room.queue).map(stripTrackAudioLink);
+        this.room.shuffleRestoreQueue = restoreQueue.length ? restoreQueue : null;
+      }
       this.room.playback = {
         ...this.room.playback,
         basePositionMs: nextPlaybackModeAnchor.basePositionMs,
@@ -1553,6 +1598,9 @@ export class ListeningRoomDO extends DurableObject {
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
       this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
+      if (!nextShuffleEnabled && previousShuffleEnabled) {
+        this.room.shuffleRestoreQueue = null;
+      }
     } else if (effectiveType === 'LINK_READY') {
       if (!isController) {
         return { ok: false, error: 'only controller can publish link' };
@@ -1648,6 +1696,7 @@ export class ListeningRoomDO extends DurableObject {
     }
 
     this.refreshCurrentStreamUrlCache();
+    this.reconcileShuffleRestoreQueue();
 
     if (isController) {
       this.refreshControllerHeartbeat();
@@ -1912,6 +1961,8 @@ export class ListeningRoomDO extends DurableObject {
         this.room.queue = snapshot.queue;
         this.room.currentIndex = snapshot.currentIndex;
         this.room.track = snapshot.track;
+        this.room.shuffleRestoreQueue = snapshot.shuffleRestoreQueue
+          ?.map(stripTrackAudioLink) || null;
         this.refreshCurrentStreamUrlCache();
         this.room.playback = {
           state: snapshot.isPlaying ? 'playing' : 'paused',

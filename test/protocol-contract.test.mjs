@@ -64,6 +64,11 @@ expectSourceContains(/resolveListenTogetherPlaybackModeQueue\(\{/, 'listener pla
 expectSourceContains(/validatePlaybackModeQueueEvent\(event\)/, 'playback mode queue validation');
 expectSourceContains(/shouldAdoptPlaybackModeQueue\(requesterQueue, nextShuffleEnabled\)/, 'legacy unchanged shuffle queue fallback');
 expectSourceContains(/isController \|\| type === 'REQUEST_PLAYBACK_MODE'/, 'playback mode queue commitment');
+expectSourceContains(/requestedShuffleRestoreQueue = snapshot\?\.shuffleEnabled === true/, 'initial shuffle restore queue capture');
+expectSourceContains(/this\.room\.shuffleRestoreQueue = snapshot\.shuffleRestoreQueue/, 'initial shuffle restore queue persistence');
+expectSourceContains(/event\?\.shuffleRestoreQueue/, 'initial shuffle restore queue local-track validation');
+expectSourceContains(/reconcileShuffleRestoreQueue\(\)/, 'shuffle restore queue reconciliation');
+expectSourceContains(/shuffleRestoreQueue: shuffleRestoreQueue\?\.length/, 'non-shuffle room restore null guard');
 expectSourceContains(/playbackModeAnchor\(this\.room\.playback, this\.currentTrack\(\), committedAt\)/, 'playback mode position reanchoring');
 expectSourceContains(/requesterQueue\.some\(\(track\) => track\?\.stableKey === requestedStableKey\)/, 'requester queue target validation');
 expectSourceContains(/clientInstanceId/, 'client instance ordering scope');
