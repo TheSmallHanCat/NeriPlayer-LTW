@@ -5,6 +5,7 @@ import {
   cachedStreamUrlsForTrack,
   normalizeStreamUrlCache,
   publicRoomStateWithCurrentStreamUrl,
+  removeCachedStreamUrls,
 } from './stream-url-cache.js';
 import { resolveListenTogetherPlaybackModeQueue } from './queue-order.js';
 import {
@@ -81,6 +82,7 @@ const ALLOWED_EVENT_TYPES = new Set([
   'TRACK_FINISHED',
   'REQUEST_LINK',
   'LINK_READY',
+  'LINK_UNAVAILABLE',
   'UPDATE_SETTINGS',
 ]);
 const CONTROLLABLE_EVENT_TYPES = new Set([
@@ -92,6 +94,7 @@ const CONTROLLABLE_EVENT_TYPES = new Set([
   'SET_QUEUE',
   'HEARTBEAT',
   'LINK_READY',
+  'LINK_UNAVAILABLE',
 ]);
 const REQUEST_CONTROL_EVENT_TYPES = new Set([
   'REQUEST_PLAY',
@@ -1450,7 +1453,12 @@ export class ListeningRoomDO extends DurableObject {
 
   async commitControlEvent({ event, type, effectiveType, senderId, senderNickname, role, eventId, isController, commitAt }) {
     const committedAt = commitAt || nowMs();
-    if (effectiveType !== 'HEARTBEAT' && effectiveType !== 'LINK_READY' && effectiveType !== 'UPDATE_SETTINGS') {
+    if (
+      effectiveType !== 'HEARTBEAT' &&
+      effectiveType !== 'LINK_READY' &&
+      effectiveType !== 'LINK_UNAVAILABLE' &&
+      effectiveType !== 'UPDATE_SETTINGS'
+    ) {
       this.clearTrackFinishBarrier();
     }
     if (effectiveType === 'PLAY' || effectiveType === 'SET_TRACK') {
@@ -1574,6 +1582,25 @@ export class ListeningRoomDO extends DurableObject {
         targetStableKey,
         streamUrls,
         committedAt
+      );
+    } else if (effectiveType === 'LINK_UNAVAILABLE') {
+      if (!isController) {
+        return { ok: false, error: 'only controller can clear link' };
+      }
+      const targetStableKey =
+        normalizeOptionalString(event.requestTrackStableKey) ||
+        sanitizeTrack(event.track)?.stableKey ||
+        null;
+      if (!targetStableKey) {
+        return { ok: false, error: 'missing requestTrackStableKey' };
+      }
+      const currentStableKey = this.currentTrackStableKey();
+      if (!currentStableKey || targetStableKey !== currentStableKey) {
+        return { ok: false, error: 'link target does not match current track' };
+      }
+      this.room.streamUrlCache = removeCachedStreamUrls(
+        this.room.streamUrlCache,
+        targetStableKey
       );
     } else if (effectiveType === 'SET_TRACK') {
       const nextQueue = this.eventQueueOrCurrent(event.queue);

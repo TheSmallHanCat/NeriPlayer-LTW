@@ -91,6 +91,14 @@ export function cacheStreamUrl(cache, stableKey, streamUrl, updatedAt = Date.now
   return cacheStreamUrls(cache, stableKey, [streamUrl], updatedAt);
 }
 
+export function removeCachedStreamUrls(cache, stableKey) {
+  const normalizedStableKey = normalizeStableKey(stableKey);
+  const next = normalizeStreamUrlCache(cache);
+  if (!normalizedStableKey) return next;
+  delete next[normalizedStableKey];
+  return next;
+}
+
 export function cachedStreamUrlsForTrack(cache, stableKey) {
   const normalizedStableKey = normalizeStableKey(stableKey);
   if (!normalizedStableKey) return [];

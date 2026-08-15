@@ -8,6 +8,7 @@ import {
   cachedStreamUrlsForTrack,
   normalizeStreamUrlCache,
   publicRoomStateWithCurrentStreamUrl,
+  removeCachedStreamUrls,
 } from '../src/stream-url-cache.js';
 
 function track(stableKey, streamUrl = null, streamUrls = []) {
@@ -127,4 +128,32 @@ test('stream URL cache rejects invalid links and remains bounded', () => {
     cachedStreamUrlForTrack(cache, `track-${MAX_STREAM_URL_CACHE_ENTRIES}`),
     `https://cdn.example.com/${MAX_STREAM_URL_CACHE_ENTRIES}.m4a`
   );
+});
+
+test('removing a current stream candidate preserves other cached tracks', () => {
+  let cache = cacheStreamUrl({}, 'preview', 'https://cdn.example.com/preview.m4a', 100);
+  cache = cacheStreamUrl(cache, 'full', 'https://cdn.example.com/full.m4a', 200);
+
+  const cleared = removeCachedStreamUrls(cache, 'preview');
+
+  assert.equal(cachedStreamUrlForTrack(cleared, 'preview'), null);
+  assert.equal(cachedStreamUrlForTrack(cleared, 'full'), 'https://cdn.example.com/full.m4a');
+});
+
+test('cleared current candidate is not exposed through public room state', () => {
+  const cleared = removeCachedStreamUrls(
+    cacheStreamUrl({}, 'current', 'https://cdn.example.com/preview.m4a', 100),
+    'current'
+  );
+  const state = publicRoomStateWithCurrentStreamUrl({
+    settings: { shareAudioLinks: true },
+    queue: [track('current')],
+    currentIndex: 0,
+    track: track('current'),
+  }, cleared);
+
+  assert.equal(state.queue[0].streamUrl, null);
+  assert.deepEqual(state.queue[0].streamUrls, []);
+  assert.equal(state.track.streamUrl, null);
+  assert.deepEqual(state.track.streamUrls, []);
 });

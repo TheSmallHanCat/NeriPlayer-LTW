@@ -48,6 +48,8 @@ expectSetContains('ALLOWED_EVENT_TYPES', 'REQUEST_PLAYBACK_MODE');
 expectSetContains('REQUEST_CONTROL_EVENT_TYPES', 'REQUEST_PLAYBACK_MODE');
 expectSetContains('ALLOWED_EVENT_TYPES', 'REQUEST_SET_QUEUE');
 expectSetContains('REQUEST_CONTROL_EVENT_TYPES', 'REQUEST_SET_QUEUE');
+expectSetContains('ALLOWED_EVENT_TYPES', 'LINK_UNAVAILABLE');
+expectSetContains('CONTROLLABLE_EVENT_TYPES', 'LINK_UNAVAILABLE');
 expectSourceContains(/const TRACK_BOUND_REQUEST_TYPES = new Set\(\[[\s\S]*'REQUEST_PLAYBACK_MODE'/, 'playback mode current-track binding');
 expectSourceContains(/const TRACK_QUEUE_BOUND_REQUEST_TYPES = new Set\(\[[\s\S]*'REQUEST_SET_TRACK'/, 'set-track queue binding');
 expectSourceContains(/member control target unavailable/, 'set-track existing queue validation');
@@ -106,6 +108,7 @@ expectSourceContains(/path === '\/leave'/, 'authenticated leave endpoint');
 expectSourceContains(/shouldIgnoreMemberChangeHeartbeat/, 'member-change heartbeat barrier');
 expectSourceContains(/requested link does not match current track/, 'stale link request rejection');
 expectSourceContains(/link target does not match current track/, 'stale link publication rejection');
+expectSourceContains(/removeCachedStreamUrls/, 'controller link cache clearing');
 expectSourceContains(/event\.forceRefresh/, 'forced cache bypass for a stalled listener');
 expectSourceContains(/local tracks cannot be shared/, 'local track rejection');
 
