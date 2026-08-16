@@ -4,6 +4,130 @@ function stableKey(track) {
     : null;
 }
 
+function referenceMapForQueue(queue) {
+  const occurrences = new Map();
+  const references = new Map();
+  queue.forEach((track) => {
+    const key = stableKey(track);
+    if (!key) return;
+    const occurrence = occurrences.get(key) || 0;
+    occurrences.set(key, occurrence + 1);
+    references.set(JSON.stringify([key, occurrence]), track);
+  });
+  return references;
+}
+
+function resolveReference(reference, references) {
+  if (!reference || typeof reference.stableKey !== 'string') return null;
+  const occurrence = Number(reference.occurrence);
+  if (!Number.isInteger(occurrence) || occurrence < 0) return null;
+  return references.get(JSON.stringify([reference.stableKey, occurrence])) || null;
+}
+
+export function applyListenTogetherQueueMutation({
+  roomQueue,
+  roomCurrentIndex,
+  mutation,
+  targetCurrentStableKey = null,
+  maxQueueSize = Number.MAX_SAFE_INTEGER,
+}) {
+  if (!Array.isArray(roomQueue) || !Array.isArray(mutation?.operations)) {
+    return { ok: false, error: 'queue mutation unavailable' };
+  }
+  const nextQueue = roomQueue.slice();
+  const references = referenceMapForQueue(nextQueue);
+  const previousCurrent = nextQueue[roomCurrentIndex] || null;
+  const targetCurrent = resolveReference(mutation.targetCurrent, references);
+
+  for (const operation of mutation.operations) {
+    const operationType = operation?.type;
+    if (operationType === 'remove' || operationType === 'move') {
+      const target = resolveReference(operation.target, references);
+      const targetIndex = target ? nextQueue.indexOf(target) : -1;
+      if (targetIndex < 0) continue;
+      const [moved] = nextQueue.splice(targetIndex, 1);
+      if (operationType === 'remove') continue;
+      const anchor = resolveReference(operation.anchor, references);
+      const anchorIndex = anchor ? nextQueue.indexOf(anchor) : -1;
+      const placement = operation.placement;
+      const insertionIndex = placement === 'prepend'
+        ? 0
+        : placement === 'before' && anchorIndex >= 0
+          ? anchorIndex
+          : nextQueue.length;
+      nextQueue.splice(insertionIndex, 0, moved);
+      continue;
+    }
+    if (operationType === 'remove_many') {
+      const targets = Array.isArray(operation.order)
+        ? operation.order
+          .map((reference) => resolveReference(reference, references))
+          .filter(Boolean)
+        : [];
+      for (const target of targets) {
+        const targetIndex = nextQueue.indexOf(target);
+        if (targetIndex >= 0) nextQueue.splice(targetIndex, 1);
+      }
+      continue;
+    }
+    if (operationType === 'insert') {
+      const track = operation.track;
+      if (!track || !stableKey(track)) continue;
+      if (nextQueue.length >= maxQueueSize) continue;
+      const anchor = resolveReference(operation.anchor, references);
+      const anchorIndex = anchor ? nextQueue.indexOf(anchor) : -1;
+      const insertionIndex = operation.placement === 'prepend'
+        ? 0
+        : operation.placement === 'before' && anchorIndex >= 0
+          ? anchorIndex
+          : nextQueue.length;
+      nextQueue.splice(insertionIndex, 0, track);
+      continue;
+    }
+    if (operationType === 'reorder') {
+      const requestedTracks = Array.isArray(operation.order)
+        ? operation.order
+          .map((reference) => resolveReference(reference, references))
+          .filter(Boolean)
+        : [];
+      if (!requestedTracks.length) continue;
+      const selected = new Set(requestedTracks);
+      const selectedSlots = nextQueue
+        .map((track, index) => selected.has(track) ? index : -1)
+        .filter((index) => index >= 0);
+      requestedTracks.forEach((track, index) => {
+        const slot = selectedSlots[index];
+        if (slot != null) nextQueue[slot] = track;
+      });
+    }
+  }
+
+  if (!nextQueue.length) {
+    return {
+      ok: true,
+      queue: [],
+      currentIndex: -1,
+      currentRemoved: previousCurrent != null,
+    };
+  }
+  const currentCandidate = nextQueue.includes(previousCurrent)
+    ? previousCurrent
+    : nextQueue.includes(targetCurrent)
+      ? targetCurrent
+      : targetCurrentStableKey
+        ? nextQueue.find((track) => stableKey(track) === targetCurrentStableKey) || null
+        : null;
+  const currentIndex = currentCandidate
+    ? nextQueue.indexOf(currentCandidate)
+    : Math.min(Math.max(Number(roomCurrentIndex) || 0, 0), nextQueue.length - 1);
+  return {
+    ok: true,
+    queue: nextQueue,
+    currentIndex,
+    currentRemoved: previousCurrent != null && !nextQueue.includes(previousCurrent),
+  };
+}
+
 export function hasSameTrackStableKeyMultiset(first, second) {
   if (first.length !== second.length) return false;
   const counts = new Map();

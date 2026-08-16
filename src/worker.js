@@ -12,6 +12,7 @@ import {
   resolveListenTogetherPlaybackModeQueue,
 } from './queue-order.js';
 import {
+  applyListenTogetherQueueMutation,
   hasSameTrackStableKeyMultiset,
   hasSameTrackStableKeySequence,
   validateListenTogetherPlaybackModeQueue,
@@ -60,6 +61,8 @@ const MEMBER_SECRET_BYTES = 32;
 const ROOM_JOIN_SECRET_BYTES = 32;
 const MAX_PROCESSED_EVENT_IDS = 256;
 const MAX_QUEUE_SIZE = 2000;
+const MAX_QUEUE_MUTATION_OPERATIONS = 64;
+const QUEUE_MUTATION_SCHEMA_VERSION = 2;
 const LINK_REQUEST_COOLDOWN_MS = 1500;
 const HEARTBEAT_SUPPRESSION_AFTER_MEMBER_CONTROL_MS = 4000;
 const ROOM_ID_LENGTH = 6;
@@ -337,7 +340,9 @@ function eventContainsLocalTrack(event) {
   if (isLocalTrackInput(event?.track)) return true;
   return (Array.isArray(event?.queue) && event.queue.some(isLocalTrackInput)) ||
     (Array.isArray(event?.shuffleRestoreQueue) &&
-      event.shuffleRestoreQueue.some(isLocalTrackInput));
+      event.shuffleRestoreQueue.some(isLocalTrackInput)) ||
+    (Array.isArray(event?.queueMutation?.operations) &&
+      event.queueMutation.operations.some((operation) => isLocalTrackInput(operation?.track)));
 }
 
 function sanitizeQueue(queue) {
@@ -349,6 +354,80 @@ function sanitizeQueue(queue) {
     if (next.length >= MAX_QUEUE_SIZE) break;
   }
   return next;
+}
+
+function sanitizeQueueReference(reference) {
+  if (!isPlainObject(reference)) return null;
+  const stableKey = normalizeOptionalString(reference.stableKey);
+  const occurrence = Number(reference.occurrence);
+  if (
+    !stableKey ||
+    !Number.isInteger(occurrence) ||
+    occurrence < 0 ||
+    occurrence >= MAX_QUEUE_SIZE
+  ) {
+    return null;
+  }
+  return { stableKey, occurrence };
+}
+
+function sanitizeQueueMutation(mutation) {
+  if (!isPlainObject(mutation)) return null;
+  const baseRoomVersion = Number(mutation.baseRoomVersion);
+  if (!Number.isInteger(baseRoomVersion) || baseRoomVersion < 0) return null;
+  if (!Array.isArray(mutation.operations) || mutation.operations.length > MAX_QUEUE_MUTATION_OPERATIONS) {
+    const onlyReorder = mutation.operations?.length === 1 && mutation.operations[0]?.type === 'reorder';
+    if (!onlyReorder) return null;
+  }
+  const operations = [];
+  for (const operation of mutation.operations) {
+    if (!isPlainObject(operation)) return null;
+    const type = normalizeOptionalString(operation.type)?.toLowerCase();
+    if (type === 'remove') {
+      const target = sanitizeQueueReference(operation.target);
+      if (!target) return null;
+      operations.push({ type, target });
+      continue;
+    }
+    if (type === 'remove_many') {
+      if (!Array.isArray(operation.order) || operation.order.length > MAX_QUEUE_SIZE) return null;
+      const order = operation.order.map(sanitizeQueueReference);
+      if (!order.length || order.some((reference) => reference == null)) return null;
+      operations.push({ type, order });
+      continue;
+    }
+    if (type === 'move') {
+      const target = sanitizeQueueReference(operation.target);
+      const placement = normalizeOptionalString(operation.placement)?.toLowerCase();
+      const anchor = sanitizeQueueReference(operation.anchor);
+      if (!target || !['before', 'append', 'prepend'].includes(placement)) return null;
+      if (placement === 'before' && !anchor) return null;
+      operations.push({ type, target, anchor, placement });
+      continue;
+    }
+    if (type === 'insert') {
+      const track = sanitizeTrack(operation.track);
+      const placement = normalizeOptionalString(operation.placement)?.toLowerCase();
+      const anchor = sanitizeQueueReference(operation.anchor);
+      if (!track || !['before', 'append', 'prepend'].includes(placement)) return null;
+      if (placement === 'before' && !anchor) return null;
+      operations.push({ type, anchor, placement, track: stripTrackAudioLink(track) });
+      continue;
+    }
+    if (type === 'reorder') {
+      if (!Array.isArray(operation.order) || operation.order.length > MAX_QUEUE_SIZE) return null;
+      const order = operation.order.map(sanitizeQueueReference);
+      if (order.some((reference) => reference == null)) return null;
+      operations.push({ type, order });
+      continue;
+    }
+    return null;
+  }
+  const targetCurrent = mutation.targetCurrent == null
+    ? null
+    : sanitizeQueueReference(mutation.targetCurrent);
+  if (mutation.targetCurrent != null && !targetCurrent) return null;
+  return { baseRoomVersion, operations, targetCurrent };
 }
 
 function stripTrackAudioLink(track) {
@@ -514,7 +593,7 @@ export class ListeningRoomDO extends DurableObject {
       roomId: null,
       joinSecret: null,
       version: 0,
-      schemaVersion: 1,
+      schemaVersion: QUEUE_MUTATION_SCHEMA_VERSION,
       controllerUserUuid: null,
       controllerUserId: null,
       controllerHeartbeatAt: null,
@@ -556,6 +635,7 @@ export class ListeningRoomDO extends DurableObject {
   async load() {
     const saved = await this.state.storage.get('room');
     if (saved) {
+      const storedSchemaVersion = Number(saved?.schemaVersion) || 1;
       const joinSecret = normalizeOptionalString(saved?.joinSecret) || randomRoomJoinSecret();
       const settings = this.normalizeSettings(saved?.settings);
       const queue = sanitizeQueue(saved?.queue);
@@ -597,6 +677,7 @@ export class ListeningRoomDO extends DurableObject {
       this.room = {
         ...this.createEmptyRoom(),
         ...saved,
+        schemaVersion: Math.max(storedSchemaVersion, QUEUE_MUTATION_SCHEMA_VERSION),
         joinSecret,
         settings,
         controllerUserUuid,
@@ -622,7 +703,13 @@ export class ListeningRoomDO extends DurableObject {
         Boolean(savedTrack?.streamUrls?.length);
       const hadStoredLocalTrack = eventContainsLocalTrack(saved);
       const cacheChanged = JSON.stringify(streamUrlCache) !== JSON.stringify(saved?.streamUrlCache || {});
-      if (!normalizeOptionalString(saved?.joinSecret) || hadStoredAudioLink || hadStoredLocalTrack || cacheChanged) {
+      if (
+        !normalizeOptionalString(saved?.joinSecret) ||
+        hadStoredAudioLink ||
+        hadStoredLocalTrack ||
+        cacheChanged ||
+        storedSchemaVersion < QUEUE_MUTATION_SCHEMA_VERSION
+      ) {
         await this.persist();
       }
     }
@@ -1114,6 +1201,16 @@ export class ListeningRoomDO extends DurableObject {
   }
 
   validateQueueUpdateEvent(event, isController) {
+    const queueMutation = sanitizeQueueMutation(event.queueMutation);
+    if (event.queueMutation != null) {
+      if (!queueMutation) {
+        return { ok: false, error: 'queue mutation is invalid' };
+      }
+      if (queueMutation.baseRoomVersion > this.room.version) {
+        return { ok: false, error: 'queue mutation base version is ahead' };
+      }
+      return { ok: true, kind: 'mutation', queueMutation };
+    }
     if (!Array.isArray(event?.queue)) {
       return { ok: false, error: 'queue update queue required' };
     }
@@ -1144,6 +1241,29 @@ export class ListeningRoomDO extends DurableObject {
       return { ok: false, error: 'queue update current track mismatch' };
     }
     return { ok: true };
+  }
+
+  validateQueueMutationEvent(event) {
+    const queueMutation = sanitizeQueueMutation(event.queueMutation);
+    if (!queueMutation) return { ok: false, error: 'queue mutation is invalid' };
+    if (queueMutation.baseRoomVersion > this.room.version) {
+      return { ok: false, error: 'queue mutation base version is ahead' };
+    }
+    return { ok: true, queueMutation };
+  }
+
+  applyQueueMutation(event) {
+    const mutation = sanitizeQueueMutation(event.queueMutation);
+    if (!mutation) return null;
+    const requestedTrack = sanitizeTrack(event.track);
+    const result = applyListenTogetherQueueMutation({
+      roomQueue: this.room.queue,
+      roomCurrentIndex: this.room.currentIndex,
+      mutation,
+      targetCurrentStableKey: requestedTrack?.stableKey || null,
+      maxQueueSize: MAX_QUEUE_SIZE,
+    });
+    return result.ok ? result : null;
   }
 
   validatePlaybackModeQueueEvent(event) {
@@ -1248,6 +1368,7 @@ export class ListeningRoomDO extends DurableObject {
       stateName: nextState,
       clientTimeMs: Number(event.clientTimeMs) || nowMs(),
       requestTrackStableKey: requestedStableKey || nextTrack?.stableKey || null,
+      queueMutation: event.queueMutation || null,
       repeatMode: normalizeRepeatMode(event.repeatMode, this.room.playback.repeatMode ?? 0),
       shuffleEnabled: nextShuffleEnabled,
     };
@@ -1281,6 +1402,12 @@ export class ListeningRoomDO extends DurableObject {
       }
       const roomQueue = Array.isArray(this.room.queue) ? this.room.queue : [];
       if (roomQueue.some((track) => track?.stableKey === requestedStableKey)) {
+        return { ok: true };
+      }
+      const queueMutation = sanitizeQueueMutation(event.queueMutation);
+      if (queueMutation?.operations.some((operation) =>
+        operation.type === 'insert' && operation.track?.stableKey === requestedStableKey
+      )) {
         return { ok: true };
       }
       return { ok: false, error: 'member control target unavailable' };
@@ -1336,7 +1463,8 @@ export class ListeningRoomDO extends DurableObject {
   }
 
   sanitizeTrackFinishProposal(event) {
-    const nextQueue = this.eventQueueOrCurrent(event.queue);
+    const mutationResult = event.queueMutation ? this.applyQueueMutation(event) : null;
+    const nextQueue = mutationResult?.queue || this.eventQueueOrCurrent(event.queue);
     if (!nextQueue.length) {
       return {
         queue: [],
@@ -1345,10 +1473,17 @@ export class ListeningRoomDO extends DurableObject {
         shouldAdvance: false,
       };
     }
+    const requestedTrack = sanitizeTrack(event.track);
+    const requestedIndex = requestedTrack
+      ? nextQueue.findIndex((track) => track?.stableKey === requestedTrack.stableKey)
+      : -1;
     const rawNextIndex = Number.isInteger(event.nextIndex)
       ? event.nextIndex
       : event.currentIndex;
-    const nextIndex = normalizeIndex(rawNextIndex, nextQueue.length, this.room.currentIndex);
+    const nextIndex = requestedIndex >= 0
+      ? requestedIndex
+      : mutationResult?.currentIndex ??
+        normalizeIndex(rawNextIndex, nextQueue.length, this.room.currentIndex);
     const nextTrack = nextQueue[nextIndex] || null;
     return {
       queue: nextQueue,
@@ -1511,68 +1646,75 @@ export class ListeningRoomDO extends DurableObject {
       ? playbackModeAnchor(this.room.playback, this.currentTrack(), committedAt)
       : null;
     if (effectiveType === 'PLAY') {
-      const nextQueue = this.eventQueueOrCurrent(event.queue);
-      const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
+      const nextQueue = this.room.queue;
+      const nextIndex = normalizeIndex(this.room.currentIndex, nextQueue.length, 0);
       this.room.playback = {
         ...this.room.playback,
         state: 'playing',
         basePositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition())),
         baseTimestampMs: committedAt,
-        repeatMode: nextRepeatMode,
-        shuffleEnabled: nextShuffleEnabled,
+        repeatMode: this.room.playback.repeatMode,
+        shuffleEnabled: this.room.playback.shuffleEnabled,
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
-      this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
+      this.room.track = nextQueue[nextIndex] || this.room.track;
     } else if (effectiveType === 'PAUSE') {
-      const nextQueue = this.eventQueueOrCurrent(event.queue);
-      const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
+      const nextQueue = this.room.queue;
+      const nextIndex = normalizeIndex(this.room.currentIndex, nextQueue.length, 0);
       this.room.playback = {
         ...this.room.playback,
         state: 'paused',
         basePositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition())),
         baseTimestampMs: committedAt,
-        repeatMode: nextRepeatMode,
-        shuffleEnabled: nextShuffleEnabled,
+        repeatMode: this.room.playback.repeatMode,
+        shuffleEnabled: this.room.playback.shuffleEnabled,
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
-      this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
+      this.room.track = nextQueue[nextIndex] || this.room.track;
     } else if (effectiveType === 'SEEK') {
-      const nextQueue = this.eventQueueOrCurrent(event.queue);
-      const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
-      const currentTrack = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.currentTrack();
+      const nextQueue = this.room.queue;
+      const nextIndex = normalizeIndex(this.room.currentIndex, nextQueue.length, 0);
+      const currentTrack = nextQueue[nextIndex] || this.currentTrack();
       this.room.playback = {
         ...this.room.playback,
         basePositionMs: Math.max(0, Number(event.positionMs ?? 0)),
         baseTimestampMs: committedAt,
-        repeatMode: nextRepeatMode,
-        shuffleEnabled: nextShuffleEnabled,
+        repeatMode: this.room.playback.repeatMode,
+        shuffleEnabled: this.room.playback.shuffleEnabled,
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
       this.room.track = currentTrack;
     } else if (effectiveType === 'HEARTBEAT') {
-      const nextQueue = this.eventQueueOrCurrent(event.queue);
-      const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
+      const nextQueue = this.room.queue;
+      const nextIndex = normalizeIndex(this.room.currentIndex, nextQueue.length, 0);
       this.room.playback = {
         ...this.room.playback,
         state: normalizePlaybackState(event.state, this.room.playback.state),
         basePositionMs: Math.max(0, Number(event.positionMs ?? this.expectedPosition())),
         baseTimestampMs: committedAt,
-        repeatMode: nextRepeatMode,
-        shuffleEnabled: nextShuffleEnabled,
+        repeatMode: this.room.playback.repeatMode,
+        shuffleEnabled: this.room.playback.shuffleEnabled,
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
-      this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
+      this.room.track = nextQueue[nextIndex] || this.room.track;
     } else if (effectiveType === 'PLAYBACK_MODE') {
       const previousShuffleEnabled = this.room.playback.shuffleEnabled === true;
       const incomingQueue = Array.isArray(event.queue) ? sanitizeQueue(event.queue) : [];
+      const queueMutation = sanitizeQueueMutation(event.queueMutation);
+      const useQueueMutation =
+        nextShuffleEnabled === true &&
+        previousShuffleEnabled !== true &&
+        queueMutation?.operations.length > 0;
+      const mutationResult = useQueueMutation ? this.applyQueueMutation(event) : null;
       const shouldApplyIncomingQueue = incomingQueue.length > 0 &&
+        !useQueueMutation &&
         (isController || type === 'REQUEST_PLAYBACK_MODE') &&
         this.shouldAdoptPlaybackModeQueue(incomingQueue, nextShuffleEnabled);
-      const playbackModeQueue = resolveListenTogetherPlaybackModeQueue({
+      const playbackModeQueue = mutationResult || resolveListenTogetherPlaybackModeQueue({
         roomQueue: this.room.queue,
         roomCurrentIndex: this.room.currentIndex,
         requesterQueue: incomingQueue,
@@ -1597,7 +1739,7 @@ export class ListeningRoomDO extends DurableObject {
       };
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
-      this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || this.room.track;
+      this.room.track = nextQueue[nextIndex] || this.room.track;
       if (!nextShuffleEnabled && previousShuffleEnabled) {
         this.room.shuffleRestoreQueue = null;
       }
@@ -1651,11 +1793,24 @@ export class ListeningRoomDO extends DurableObject {
         targetStableKey
       );
     } else if (effectiveType === 'SET_TRACK') {
-      const nextQueue = this.eventQueueOrCurrent(event.queue);
-      const nextIndex = normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
+      const mutationResult = event.queueMutation ? this.applyQueueMutation(event) : null;
+      const nextQueue = mutationResult?.queue || this.eventQueueOrCurrent(event.queue);
+      const requestedStableKey = requestedStableKeyForEvent(
+        event,
+        nextQueue,
+        event.currentIndex,
+        this.currentTrack()
+      );
+      const requestedIndex = requestedStableKey
+        ? nextQueue.findIndex((track) => track?.stableKey === requestedStableKey)
+        : -1;
+      const nextIndex = requestedIndex >= 0
+        ? requestedIndex
+        : mutationResult?.currentIndex ??
+          normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
-      this.room.track = sanitizeTrack(event.track) || nextQueue[nextIndex] || null;
+      this.room.track = nextQueue[nextIndex] || sanitizeTrack(event.track) || null;
       this.room.playback = {
         ...this.room.playback,
         state: event.shouldPlay ? 'playing' : 'paused',
@@ -1666,9 +1821,11 @@ export class ListeningRoomDO extends DurableObject {
       };
     } else if (effectiveType === 'SET_QUEUE') {
       const previousTrack = this.currentTrack();
-      const nextQueue = this.eventQueueOrCurrent(event.queue, true);
+      const mutationResult = event.queueMutation ? this.applyQueueMutation(event) : null;
+      const nextQueue = mutationResult?.queue || this.eventQueueOrCurrent(event.queue, true);
       const nextIndex = nextQueue.length
-        ? normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex)
+        ? mutationResult?.currentIndex ??
+          normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex)
         : -1;
       const nextTrack = nextQueue[nextIndex] || null;
       const trackChanged = previousTrack?.stableKey !== nextTrack?.stableKey;
@@ -1954,7 +2111,7 @@ export class ListeningRoomDO extends DurableObject {
         this.room.joinSecret = randomRoomJoinSecret();
         this.room.controllerUserUuid = normalizedUserUuid;
         this.room.controllerUserId = normalizedUserUuid;
-        this.room.schemaVersion = 1;
+        this.room.schemaVersion = QUEUE_MUTATION_SCHEMA_VERSION;
         this.room.settings = snapshot.settings;
         this.room.members[normalizedUserUuid] = buildMember({ userUuid: normalizedUserUuid, nickname: normalizedNickname, role: 'controller', joinedAt: nowMs() });
         this.refreshControllerHeartbeat();
@@ -2278,6 +2435,16 @@ export class ListeningRoomDO extends DurableObject {
       };
     }
 
+    if (event.queueMutation != null) {
+      if (!['SET_QUEUE', 'SET_TRACK', 'PLAYBACK_MODE', 'TRACK_FINISHED'].includes(effectiveType)) {
+        return { ok: false, error: 'queue mutation event type unsupported' };
+      }
+      const queueMutationCheck = this.validateQueueMutationEvent(event);
+      if (!queueMutationCheck.ok) {
+        return { ok: false, error: queueMutationCheck.error };
+      }
+    }
+
     if (effectiveType === 'SET_QUEUE') {
       const queueUpdateCheck = this.validateQueueUpdateEvent(event, isController);
       if (!queueUpdateCheck.ok) {
@@ -2392,6 +2559,7 @@ export class ListeningRoomDO extends DurableObject {
         shuffleEnabled: forwardedPayload.shuffleEnabled,
         clientTimeMs: forwardedPayload.clientTimeMs,
         requestTrackStableKey: forwardedPayload.requestTrackStableKey,
+        queueMutation: forwardedPayload.queueMutation,
       };
       return this.commitControlEvent({
         event: committedEvent,
