@@ -42,6 +42,18 @@ test('queue mutation replays a stale move on the latest queue and keeps remote i
   assert.equal(result.currentIndex, 3);
 });
 
+test('queue mutation reports the exact target occurrence without changing generic current selection', () => {
+  const result = applyListenTogetherQueueMutation({
+    roomQueue: [track('dup'), track('dup')],
+    roomCurrentIndex: 0,
+    mutation: mutation([], reference('dup', 1)),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.currentIndex, 0);
+  assert.equal(result.targetCurrentIndex, 1);
+});
+
 test('queue mutations preserve two independent moves regardless of arrival order', () => {
   const first = applyListenTogetherQueueMutation({
     roomQueue: [track('a'), track('b'), track('c'), track('d')],
