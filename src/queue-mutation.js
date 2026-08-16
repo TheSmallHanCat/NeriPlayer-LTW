@@ -107,9 +107,11 @@ export function applyListenTogetherQueueMutation({
       ok: true,
       queue: [],
       currentIndex: -1,
+      targetCurrentIndex: null,
       currentRemoved: previousCurrent != null,
     };
   }
+  const targetCurrentIndex = targetCurrent ? nextQueue.indexOf(targetCurrent) : -1;
   const currentCandidate = nextQueue.includes(previousCurrent)
     ? previousCurrent
     : nextQueue.includes(targetCurrent)
@@ -124,6 +126,7 @@ export function applyListenTogetherQueueMutation({
     ok: true,
     queue: nextQueue,
     currentIndex,
+    targetCurrentIndex: targetCurrentIndex >= 0 ? targetCurrentIndex : null,
     currentRemoved: previousCurrent != null && !nextQueue.includes(previousCurrent),
   };
 }

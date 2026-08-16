@@ -1480,10 +1480,11 @@ export class ListeningRoomDO extends DurableObject {
     const rawNextIndex = Number.isInteger(event.nextIndex)
       ? event.nextIndex
       : event.currentIndex;
-    const nextIndex = requestedIndex >= 0
-      ? requestedIndex
-      : mutationResult?.currentIndex ??
-        normalizeIndex(rawNextIndex, nextQueue.length, this.room.currentIndex);
+    const nextIndex = mutationResult?.targetCurrentIndex ??
+      (requestedIndex >= 0
+        ? requestedIndex
+        : mutationResult?.currentIndex ??
+          normalizeIndex(rawNextIndex, nextQueue.length, this.room.currentIndex));
     const nextTrack = nextQueue[nextIndex] || null;
     return {
       queue: nextQueue,
@@ -1804,10 +1805,11 @@ export class ListeningRoomDO extends DurableObject {
       const requestedIndex = requestedStableKey
         ? nextQueue.findIndex((track) => track?.stableKey === requestedStableKey)
         : -1;
-      const nextIndex = requestedIndex >= 0
-        ? requestedIndex
-        : mutationResult?.currentIndex ??
-          normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex);
+      const nextIndex = mutationResult?.targetCurrentIndex ??
+        (requestedIndex >= 0
+          ? requestedIndex
+          : mutationResult?.currentIndex ??
+            normalizeIndex(event.currentIndex, nextQueue.length, this.room.currentIndex));
       this.room.queue = nextQueue;
       this.room.currentIndex = nextIndex;
       this.room.track = nextQueue[nextIndex] || sanitizeTrack(event.track) || null;
