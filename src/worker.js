@@ -1945,14 +1945,22 @@ export class ListeningRoomDO extends DurableObject {
   }
 
   async leaveMember(auth) {
+    const member = this.room.members[auth.userUuid];
+    if (!member) return { ok: false, error: 'member not in room' };
+    const nickname = member.nickname || auth.nickname || auth.userUuid;
     if (auth.userUuid === this.room.controllerUserUuid) {
+      if (this.room.settings?.autoPauseOnMemberChange === true) {
+        await this.pauseForMemberChange(
+          `member_left:${nickname}`,
+          auth.userUuid,
+          nickname,
+          'MEMBER_LEFT'
+        );
+      }
       await this.closeRoom('controller_left');
       return { ok: true };
     }
 
-    const member = this.room.members[auth.userUuid];
-    if (!member) return { ok: false, error: 'member not in room' };
-    const nickname = member.nickname || auth.nickname || auth.userUuid;
     delete this.room.members[auth.userUuid];
     this.room.version += 1;
     for (const [sessionId, session] of this.sessions.entries()) {
@@ -1962,18 +1970,32 @@ export class ListeningRoomDO extends DurableObject {
         session.ws.close(4000, 'member_left');
       } catch {}
     }
-    await this.persist();
-    await this.broadcastRoomState(
-      'room_state_updated',
-      {
-        userUuid: auth.userUuid,
-        userId: auth.userUuid,
-        nickname,
-        eventId: null,
-        type: 'MEMBER_LEFT',
-      },
-      `member_left:${nickname}`
+    const memberChangeVersion = this.room.version;
+    const causedBy = {
+      userUuid: auth.userUuid,
+      userId: auth.userUuid,
+      nickname,
+      eventId: null,
+      type: 'MEMBER_LEFT',
+    };
+    const shouldPause =
+      !this.room.trackFinishBarrier &&
+      this.room.settings?.autoPauseOnMemberChange === true;
+    const paused = shouldPause && await this.pauseForMemberChange(
+      `member_left:${nickname}`,
+      auth.userUuid,
+      nickname,
+      'MEMBER_LEFT',
+      memberChangeVersion
     );
+    if (!paused) {
+      await this.persist();
+      await this.broadcastRoomState(
+        'room_state_updated',
+        causedBy,
+        `member_left:${nickname}`
+      );
+    }
     return {
       ok: true,
       applied: this.buildAppliedPayload('MEMBER_LEFT', auth.userUuid, null, nickname),
