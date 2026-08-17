@@ -7,13 +7,14 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "check:runtime": "node scripts/check-node-version.mjs",
     "lint": "node --check src/worker.js && node --check src/stream-url-cache.js && node --check src/queue-order.js && node --check src/queue-mutation.js && node --check src/playback-position.js",
     "test": "node --test test/*.test.mjs",
     "deploy:dry-run": "wrangler deploy --dry-run",
-    "check": "npm run lint && npm test && npm run deploy:dry-run"
+    "check": "npm run check:runtime && npm run lint && npm test && npm run deploy:dry-run"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.0.0"
   },
   "cloudflare": {
     "bindings": {

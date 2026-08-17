@@ -174,7 +174,7 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 
 ## 环境要求
 
-- Node.js `>= 20`
+- Node.js `>= 22.0.0`
 - Cloudflare 账号
 - Wrangler 4
 
