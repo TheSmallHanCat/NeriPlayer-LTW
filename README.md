@@ -21,8 +21,7 @@
 - 本地歌曲不能创建房间或进入同步事件；关闭 `shareAudioLinks` 后会立刻清空
   房间里已缓存的候选
 - 房间状态持久化、控制者离线检测与自动关房
-- 新成员加入时可按房间设置自动暂停；同一成员使用 `memberSecret` 或 Token 重连不会触发暂停
-- 成员通过“离开房间”接口显式退出时，Worker 会删除成员并广播 `MEMBER_LEFT`；普通 WebSocket 断线仍保留成员以支持重连
+- 开启自动暂停时，新成员加入和成员通过“离开房间”接口显式退出都会暂停房间并广播权威状态；同一成员使用 `memberSecret` 或 Token 重连不会触发暂停，普通 WebSocket 断线仍保留成员以支持重连
 - 控制事件可携带 `clientInstanceId`、`clientSequence`、`clientTimeMs`，Worker 会
   过滤过期顺序；WebSocket 支持 `np_ping` / `np_pong` 返回服务端时钟并刷新房主存活时间
 - 支持 `Deploy to Cloudflare` 一键部署或本地源码手动部署

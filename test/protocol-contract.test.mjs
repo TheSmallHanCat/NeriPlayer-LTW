@@ -111,6 +111,21 @@ expectSourceContains(/async leaveMember\(auth\)/, 'explicit member leave handlin
 expectSourceContains(/delete this\.room\.members\[auth\.userUuid\]/, 'explicit member removal');
 expectSourceContains(/type: 'MEMBER_LEFT'/, 'member leave broadcast');
 expectSourceContains(/path === '\/leave'/, 'authenticated leave endpoint');
+const leaveMemberSource = workerSource.match(
+  /async leaveMember\(auth\) \{([\s\S]*?)\n  \}\n\n  async closeRoom/
+);
+if (!leaveMemberSource) {
+  throw new Error('worker must keep explicit member leave implementation');
+}
+if (!/pauseForMemberChange\([\s\S]*?'MEMBER_LEFT'/.test(leaveMemberSource[1])) {
+  throw new Error('enabled member leave must publish an authoritative pause');
+}
+if (!/auth\.userUuid === this\.room\.controllerUserUuid[\s\S]*?autoPauseOnMemberChange === true[\s\S]*?pauseForMemberChange\([\s\S]*?'MEMBER_LEFT'[\s\S]*?closeRoom\('controller_left'\)/.test(leaveMemberSource[1])) {
+  throw new Error('controller leave must pause members before closing the room');
+}
+if (!/!this\.room\.trackFinishBarrier[\s\S]*autoPauseOnMemberChange === true/.test(leaveMemberSource[1])) {
+  throw new Error('member leave auto-pause must preserve the track-finish barrier');
+}
 expectSourceContains(/shouldIgnoreMemberChangeHeartbeat/, 'member-change heartbeat barrier');
 expectSourceContains(/requested link does not match current track/, 'stale link request rejection');
 expectSourceContains(/link target does not match current track/, 'stale link publication rejection');
