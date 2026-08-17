@@ -82,6 +82,7 @@ expectSourceContains(/shouldSkipMemberChangeAutoPause/, 'member-change auto-paus
 expectSourceContains(/memberChangeVersion/, 'member-change version barrier');
 expectSourceContains(/msg\.type === 'np_ping'/, 'custom clock-sync ping handling');
 expectSourceContains(/type: 'np_pong'/, 'custom clock-sync pong handling');
+expectSourceContains(/type: 'control_result',[\s\S]*causedBy: \{[\s\S]*eventId: msg\.eventId \|\| null/, 'control result event identity');
 expectSourceContains(/async refreshControllerHeartbeatForSocket\(session\)/, 'socket heartbeat refresh helper');
 expectSourceContains(/if \(msg\.type === 'np_ping'\) \{\s+await this\.refreshControllerHeartbeatForSocket\(session\);/, 'controller heartbeat refresh on custom ping');
 expectSourceContains(/serverNowMs: nowMs\(\)/, 'HTTP state server clock timestamp');

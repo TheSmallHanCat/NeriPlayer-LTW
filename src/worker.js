@@ -2357,6 +2357,13 @@ export class ListeningRoomDO extends DurableObject {
         result,
         nowMs: nowMs(),
         message: result.error || null,
+        causedBy: {
+          userUuid: session.auth.userUuid,
+          userId: session.auth.userUuid,
+          nickname: session.auth.nickname,
+          eventId: msg.eventId || null,
+          type: msg.type || null,
+        },
       }));
     } catch (err) {
       try {
