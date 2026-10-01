@@ -101,8 +101,9 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 中已有的曲目，成员携带的队列不会写入房态。`REQUEST_SET_QUEUE` 每次只允许一种
 受校验的队列变更：保留当前曲目的重排、单曲插入、单曲移除，或移除当前曲目后按
 移除位置选择下一首（末尾则选择前一首）；单曲队列还可被清空。它不会允许一次替换
-多首曲目，并会保留未受影响时的播放状态和进度。控制事件如果带有同一客户端实例的
-`clientSequence` 或较旧的 `clientTimeMs`，也会被 Worker 丢弃。
+多首曲目，并会保留未受影响时的播放状态和进度。控制事件排序优先使用同一用户、同一
+客户端实例的有效 `clientSequence`，只丢弃小于或等于已记录序号的事件。无法使用序号时，
+才按用户比较 `clientTimeMs` 并丢弃时间严格更早的事件。
 协议版本 2 的 Android 客户端会在 `schemaVersion=2` 的房间中发送带
 `queueMutation.baseRoomVersion` 的移动、插入、移除或紧凑重排操作。Worker 会把操作
 重放到收到事件时的最新权威队列，保留已经到达的远端增删，并按稳定键重算当前曲目索引；
@@ -119,10 +120,14 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
 
 ### 服务端位置字段
 
-房间快照和广播消息中的 `expectedPositionMs` 由服务端根据当前播放状态推算：
+`GET /api/rooms/:roomId/state` 响应在顶层返回 `expectedPositionMs` 和 `serverNowMs`；
+WebSocket 的 `room_state_updated` 广播在顶层返回 `expectedPositionMs` 和 `nowMs`。
+这些是消息层字段，不属于 `state` 房间快照。
+
+`expectedPositionMs` 由服务端根据当前播放状态推算：
 播放中时按 `basePositionMs + elapsed * playbackRate` 前进，暂停时保持基础位置。
 当 `repeatMode=1` 且当前曲目时长有效时，位置会按曲目时长取模；其他模式保持
-非负的推算值。客户端应使用该字段配合 `nowMs` 校正本地进度，不要把候选播放地址
+非负的推算值。客户端应使用该字段配合对应消息的服务端时间校正本地进度，不要把候选播放地址
 缓存当成普通歌曲缓存。
 
 ## 房间与身份约束
@@ -151,7 +156,7 @@ Worker 只负责房间状态、权限、队列、同步事件和当前曲目的�
   缓存并向在线房主请求刷新，用于候选失效后的恢复
 - 房主确认当前曲目只能得到试听片段时会发送 `LINK_UNAVAILABLE`，Worker 只清除该当前
   曲目的候选缓存并广播最新房态，避免旧试听地址继续下发给听众
-- 房态里的 `expectedPositionMs` 是服务端推算的位置，播放中会随
+- 响应或广播顶层的 `expectedPositionMs` 是服务端推算的位置，播放中会随
   `playbackRate` 前进；单曲循环按当前曲目 `durationMs` 回绕。提交循环或随机模式前
   会先按旧播放语义重新锚定位置，避免新一轮已经开始时仍停留在上一轮曲末
 - Token 有效期为 **24 小时**，由 `LISTEN_TOGETHER_TOKEN_SECRET` 参与 HMAC 签名
@@ -192,8 +197,9 @@ npm run check
 npx wrangler dev
 ```
 
-`npm run check` 会依次检查 `src/worker.js` 与 `src/stream-url-cache.js`，运行
-`test/*.test.mjs` 的缓存和协议测试，再执行 `wrangler deploy --dry-run`。
+`npm run check` 会依次校验 Node.js 版本，对 `src/worker.js`、`src/stream-url-cache.js`、
+`src/queue-order.js`、`src/queue-mutation.js` 和 `src/playback-position.js` 执行 `node --check`，
+运行 `test/*.test.mjs` 的缓存、队列、位置和协议测试，再执行 `wrangler deploy --dry-run`。
 它不替代真实 Cloudflare 环境中的 create/join/WebSocket 流程验证。
 
 本地开发可复制 `.dev.vars.example` 为 `.dev.vars`，并填入
